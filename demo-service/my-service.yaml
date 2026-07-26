@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-service
+spec:
+  ports:
+  - port: 3000 # Service 對外/對內的 port（給別人打的）
+    nodePort: 30390
+    protocol: TCP
+    targetPort: 3000 # 實際轉發到 container 監聽的 port , port 是「別人要連你（Service）打哪個 port」，targetPort 是「你（Service）要轉給 Pod 的哪個 port」
+  selector:
+    app: my-deployment
+  type: NodePort

@@ -7,6 +7,8 @@
 - [Day 6](#day-6) - Node 概念與 Kubernetes 內部運作
 - [Day 7](#day-7) - Replication Controller 與 Pod 橫向擴展
 - [Day 8](#day-8) - Replica Set 與 Deployment（Rollout / Rollback）
+- [Day 9](#day-9) - Service 的類型與運作原理
+- [Day 10](#day-10) - Labels、Annotations 與 nodeSelector
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -23,6 +25,9 @@
 - **Replication Controller**：`replicas`、`selector`、Pod 自我修復、`kubectl scale`、`--cascade=false`
 - **Replica Set**：`matchLabels`、`matchExpressions`（`In`/`NotIn`/`Exists`/`DoesNotExist`）
 - **Deployment**：`kubectl set image`、`kubectl rollout status/history/undo`、`maxSurge`、`maxUnavailable`、zero downtime deployment
+- **Service**：`ClusterIP`（預設）/ `NodePort` / `LoadBalancer`、`targetPort`、Dynamic Cluster IP、NodePort Range（30000~32767）
+- **Labels / Annotations**：Labels 可被 Selector 篩選，Annotations 僅供人員備註不參與篩選
+- **nodeSelector**：Pod 綁定特定 Node、`Pending` 狀態排查
 
 
 # Day5
@@ -379,6 +384,241 @@ $ kubectl rollout undo deploy hello-deployment --to-revision=3   # 回滾到指�
 - Deployment = Replica Set + Rollout/Rollback 能力，是實務上管理 Pod 的建議做法。
 - 下一篇（Day 9）主題：`Service`。
 
+# Day 9
+
+> 參考來源：[[Day 9] 建立外部服務與 Pods 的溝通管道 - Services](https://ithelp.ithome.com.tw/articles/10194344)
+
+## 為什麼需要 Service
+
+Deployment 做 rollout 時，會不斷用新 Pod 取代舊 Pod（[Day 8](#day-8)），Pod 的 IP 是**動態、會消失重生**的。因此需要一個穩定的中間層，讓外部使用者或其他服務不必關心背後 Pod 是誰、有幾個、換過幾輪，永遠都能連到「目前可用的 Pod」——這就是 Service 的角色。
+
+Service 主要提供三種存取方式：
+
+- **ClusterIP**：Kubernetes 會分配一組虛擬 IP，讓 Cluster 內其他物件可以透過這組 IP 存取 Pod（未指定 `type` 時的預設值）。
+- **NodePort**：讓 Cluster 外、但同一台 Node 上的服務，可透過 Node 的實體 port 存取 Cluster 內的 Pod。
+- **LoadBalancer**：架在雲端服務（AWS、GCP 等）時可指定 `--type=LoadBalancer`，由 cloud provider 自動建立對應的 Load Balancer 來分流量給各個 Node。
+
+## Service YAML 範例
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-service
+spec:
+  type: NodePort
+  ports:
+  - port: 3000
+    nodePort: 30390
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: my-deployment
+```
+
+- **`spec.type`**：`ClusterIP`（預設）、`NodePort`、`LoadBalancer`。
+- **`spec.ports.port`**：Service 自己（ClusterIP）對外的 port number。
+- **`spec.ports.targetPort`**：實際轉發到 Pod 內部 container 的 port number。
+- **`spec.ports.nodePort`**：Node 上對外開放的 port number；不指定的話 Kubernetes 會隨機分配。
+- **`spec.ports.protocol`**：支援 `TCP` / `UDP`，預設 `TCP`。
+- **`spec.selector`**：決定這個 Service 要把流量導向哪些 labels 符合條件的 Pod。
+
+> ⚠️ **原文小提醒**：部落格內文寫「導向標籤為 `app=my-pod` 的 Pods」，但範例 yaml 裡 `selector` 其實是 `app: my-deployment`，兩者對不上——這應該只是原文筆誤，真正生效的是 yaml 裡的 `selector` 值，`Pod` 是否被選中永遠以 `selector` 跟 Pod 自己的 `labels` 是否相符為準，跟文字敘述無關。
+
+## Service 存取流程圖：NodePort / port / targetPort / ClusterIP / LoadBalancer
+
+```
+                        [雲端 LoadBalancer]   ← 只有 type=LoadBalancer 才會有這一層
+                                │                  （由 Cloud Provider 建立，如 AWS ELB）
+                                │  統一對外入口
+                                ▼
+        ┌───────────────────────────────────────────────────────┐
+        │ Node (VM)                                              │
+        │                                                        │
+        │   NodePort: 30390 ◄── 叢集外部可直接打 <NodeIP>:30390    │
+        │        │              （type=NodePort 才會開這個 port）  │
+        │        ▼                                                │
+        │  ┌────────────────────────────────────────────────┐    │
+        │  │ Service: hello-service                          │    │
+        │  │   ClusterIP: 10.97.167.45                        │    │
+        │  │   port: 3000  ◄── 叢集內部（其他 Pod）打這個 port   │    │
+        │  └────────────────────────────────────────────────┘    │
+        │        │                                                │
+        │        ▼ targetPort: 3000                               │
+        │        （Service 轉發流量到 Pod 實際監聽的 port）          │
+        │  ┌────────────────────────────────────────────────┐    │
+        │  │ Pod: my-deployment-xxxx                         │    │
+        │  │   container port: 3000                          │    │
+        │  └────────────────────────────────────────────────┘    │
+        └───────────────────────────────────────────────────────┘
+```
+
+**存取路徑對照表**
+
+| 存取者 | 存取方式 | 用到的 port |
+| --- | --- | --- |
+| Cluster 內其他 Pod | `<ClusterIP>:port` | `port`（3000） |
+| Cluster 外部、同一 Node | `<NodeIP>:nodePort` | `nodePort`（30390），僅 `NodePort`/`LoadBalancer` 類型才有 |
+| Cluster 外部、雲端環境 | `<LoadBalancer-IP>:port` | LoadBalancer 對外統一入口，內部仍會轉給每個 Node 的 `nodePort` |
+| Service → Pod（一律自動） | 內部轉發 | `targetPort`（3000），對應 container 實際監聽的 port |
+
+**三種 Service type 一句話差異**：
+
+- **ClusterIP**（預設）：只給「叢集內部」互相存取，是其他兩種類型的基礎。
+- **NodePort**：在 ClusterIP 之上，額外於每個 Node 開一個實體 `nodePort`（30000~32767），讓叢集外部也能連進來。
+- **LoadBalancer**：在 NodePort 之上，再由 Cloud Provider 建立一個對外統一的 Load Balancer，自動把流量分散到各個 Node 的 `nodePort`，是三者中最外層、最貼近終端使用者的入口。
+
+## 實作重點
+
+```bash
+$ kubectl create -f ./my-deployment.yaml     # 先確保有 Pod 可以被 Service 選中
+$ kubectl create -f ./my-service.yaml
+$ kubectl get svc                            # 或 kubectl get services
+```
+
+進到 Cluster 內部（例如用一個 alpine Pod）驗證 Service 是否正常運作：
+- port 是「別人要連你（Service）打哪個 port」
+- targetPort 是「你（Service）要轉給 Pod 的哪個 port」
+```bash
+$ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
+/ # curl <cluster-ip>:3000
+Hello World!
+```
+
+外部存取則可用 `minikube service` 取得對應的 NodePort URL：
+
+```bash
+$ minikube service hello-service --url
+http://192.168.99.100:30390
+```
+
+**Dynamic Cluster IP**：如果刪掉 Service 再重新建立，只要沒有在 yaml 明確指定 IP，Cluster IP 每次都會被系統重新隨機分配，跟前一次不會相同：
+
+```bash
+$ kubectl delete svc/hello-service && kubectl create -f ./my-service.yaml
+```
+
+## NodePort 的限制
+
+Service 可指定的 `nodePort` 預設範圍是 **30000 ~ 32767**。如果需要調整範圍，要在啟動 Node 時指定，以 minikube 為例：
+
+```bash
+$ minikube stop && minikube start --extra-config=apiserver.ServiceNodePortRange=1-50000
+```
+
+啟動後即可用 `kubectl edit svc/<name>` 把既有 Service 的 `nodePort` 改到新範圍內的值。
+
+> ⚠️ **原文另一處疑似筆誤**：原文寫 nodePort 預設範圍是「3000~32767」，但根據 Kubernetes 官方文件與 [Day 5](#day5) 筆記中的紀錄，正確預設範圍應該是 **30000～32767**（少打一個 0），這裡以正確數字為準。
+
+## 我的想法
+
+- Service 的本質是「把 Pod 的動態性，轉換成一個穩定的存取入口」，這跟 [Day 6](#day-6) 提到的 `kube-proxy` 持續把最新的 Pod 清單同步給 `iptables` 是同一件事的兩面：Service/Selector 決定「誰是合法後端」，`kube-proxy`/`iptables` 負責把新連線動態導向這些後端。
+- 也因此可以理解，前面在 [Day 8](#day-8) 討論過的「rollout 後網頁還是舊內容」情境：只要 Service 的 `selector` 沒變，Service 這一層的角色從頭到尾沒變過——真正變動的是 `iptables` 背後那份「目前有效 Pod」清單，以及既有 TCP 連線是否被沿用。
+- Cluster IP 是動態的這件事，也直接點出下一步的真正痛點：如果服務之間（例如 web app 要連 database）都要手動查 IP，一旦 Service 重建 IP 就變了，設定檔就得跟著改。這正是為什麼 Kubernetes 需要 **DNS-based Service Discovery**（用穩定的 Service name 取代易變的 IP），也是原文預告會在 Day 17 深入介紹的主題。
+
+## 小結
+
+- Service 有 `ClusterIP` / `NodePort` / `LoadBalancer` 三種類型，各自解決「誰能存取 Pod」的不同範圍問題。
+- Cluster IP 預設是動態分配的，重建 Service 就會改變；NodePort 預設範圍是 30000~32767，可透過啟動參數調整。
+- 下一篇（Day 10）主題：`Labels`。
+
+# Day 10
+
+> 參考來源：[[Day 10] Kubernetes 世界不可缺少的 - Labels](https://ithelp.ithome.com.tw/articles/10194613)
+
+## Labels 是什麼
+
+Labels 就是一組**具有辨識度的 key/value**，貼在物件上用來標示屬性、分群管理，例如：
+
+- `release: stable` / `release: qa`
+- `environment: dev` / `environment: production`
+- `tier: backend` / `tier: frontend`
+
+特點：
+
+- 一個物件可以同時擁有多個 labels（multiple labels）。
+- 可以透過 **Selector** 篩選、縮小要操作的物件範圍。
+- 除了 `key=value` 的等於關係（Equality-based），也能用 `matchExpressions` 做更彈性的篩選（跟 [Day 8](#day-8) Replica Set 提到的 `In`/`NotIn`/`Exists`/`DoesNotExist` 是同一套機制）。
+
+## Annotations 是什麼
+
+Annotations 是**沒有識別用途**的標籤，用來記錄給人看、給工具看的輔助資訊（例如發行時間、版本、聯絡人 email），**Kubernetes 本身不會拿 Annotations 來做篩選或排程**，純粹是方便開發者與維運人員管理。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+  labels:
+    app: webserver
+    tier: backend
+  annotations:
+    version: latest
+    release_date: 2017/12/28
+    contact: zxcvbnius@gmail.com
+spec:
+  containers:
+  - name: pod-demo
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+```
+
+```bash
+$ kubectl create -f ./my-pod.yaml
+$ kubectl get pods --show-labels        # 看 labels
+$ kubectl describe pods my-pod          # 看 annotations
+```
+
+**動態新增 Labels**：
+
+```bash
+$ kubectl label pods my-pod env=production
+$ kubectl get pods my-pod --show-labels
+# LABELS: app=webserver,env=production,tier=backend
+```
+
+## 實作：將 Pod 部署到特定的 Node（nodeSelector）
+
+Labels 的概念同樣可以套用在 **Node** 上：先幫 Node 貼標籤，再讓 Pod 用 `nodeSelector` 指定「只想被排程到帶有特定 label 的 Node」。
+
+```yaml
+# my-pod-with-node-selector.yaml（節錄）
+spec:
+  nodeSelector:
+    hardware: high-memory
+  containers:
+  - ...
+```
+
+```bash
+$ kubectl create -f ./my-pod-with-node-selector.yaml
+$ kubectl get pods
+# my-pod   0/1   Pending   0   ...
+```
+
+因為 Cluster 裡還沒有任何 Node 帶有 `hardware=high-memory` 這個 label，Pod 會卡在 **`Pending`** 狀態，`kubectl describe pod` 會看到排程失敗、找不到符合條件的 Node。幫 Node 補上對應 label 後，Pod 就會立刻被排程成功：
+
+```bash
+$ kubectl label node minikube hardware=high-memory
+$ kubectl get pods
+# my-pod   1/1   Running   0   ...
+```
+
+> 實務情境：如果有兩種 Pod，一種吃記憶體、一種吃 CPU，就能透過幫 Node 貼上不同 label + Pod 設定對應 `nodeSelector`，讓資源分配更有效率。原文也提到 `nodeSelector` 之外還有更彈性的 **Affinity / anti-affinity**（當時仍是 beta 版本）。
+
+## 我的想法
+
+- 這一天其實是把前幾天看過的東西「打回原形」：[Day 7](#day-7) RC 的 `selector`、[Day 8](#day-8) RS 的 `matchLabels`/`matchExpressions`、[Day 9](#day-9) Service 的 `selector`，全部都是同一套 **Labels + Selector** 機制的不同應用場景而已，只是「被選中的對象」分別是 Pod（給 RC/RS/Deployment 管理）跟 Pod（給 Service 導流）。理解了 Day 10 這個底層機制，回頭看前幾天的 yaml 會更有「原來都是同一招」的感覺。
+- **Labels 可以拿來 selector，Annotations 不行**——這是很容易搞混、也是 CKAD 考試常見的細節陷阱：如果考題要求「用某個 key/value 篩選/選取物件」，答案一定是改 `labels`，改 `annotations` 是沒有作用的。
+- `nodeSelector` 嚴格來說是 **Node 排程**的範疇，在目前官方 CKAD 考綱（見下方 CKAD TEST）裡其實沒有被明確列為考點，比較偏向 CKA（Cluster Admin）在管理多節點 Cluster 時才需要深入的技能。對準備 CKAD 的人來說，這天真正該內化的重點是 **Labels/Selector 的通用概念**，而不是 `nodeSelector` 本身的排程細節——考試時間有限，優先度可以放在 Selector 怎麼被 Service、Deployment 等物件使用上。
+
+## 小結
+
+- Labels 用於分類、篩選（Selector 用得到）；Annotations 只是給人看的備註（Selector 用不到）。
+- `nodeSelector` 讓 Pod 只被排程到帶有特定 label 的 Node，沒有符合的 Node 時 Pod 會卡在 `Pending`。
+- 下一篇（Day 11）主題：`Health Checks`。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -400,7 +640,7 @@ $ kubectl rollout undo deploy hello-deployment --to-revision=3   # 回滾到指�
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
-| Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment） |
+| Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
 | Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通，但尚未介紹 sidecar / init pattern） |
 | Utilize persistent and ephemeral volumes | Volume 的使用 | 尚未涉及 |
 
@@ -441,10 +681,12 @@ $ kubectl rollout undo deploy hello-deployment --to-revision=3   # 回滾到指�
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | NetworkPolicies | 網路流量控管規則 | 尚未涉及 |
-| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發，有助於理解 Service 連線原理） |
+| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制） |
 | Ingress | 對外路由規則 | 尚未涉及 |
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 基礎操作與底層原理（Day 5、Day 6）、基本 CLI 監控指令。
-- 佔分最重（25%）的 Environment/Config/Security 幾乎完全尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、Probes 等，是 Day 9 之後應優先加強的重點。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、基本 CLI 監控指令。
+- Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 與 `Ingress` 尚未涉及，其餘知識點已有不錯的覆蓋。
+- **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
+- 佔分最重（25%）的 Environment/Config/Security 幾乎完全尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、Probes 等，是 Day 11 之後應優先加強的重點。
