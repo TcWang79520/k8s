@@ -9,6 +9,9 @@
 - [Day 8](#day-8) - Replica Set 與 Deployment（Rollout / Rollback）
 - [Day 9](#day-9) - Service 的類型與運作原理
 - [Day 10](#day-10) - Labels、Annotations 與 nodeSelector
+- [Day 11](#day-11) - Health Checks（Liveness Probe）
+- [Day 12](#day-12) - Secrets（敏感資料管理）
+- [Day 13](#day-13) - Demo：在 minikube 上架設 Stateless Wordpress
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -28,6 +31,9 @@
 - **Service**：`ClusterIP`（預設）/ `NodePort` / `LoadBalancer`、`targetPort`、Dynamic Cluster IP、NodePort Range（30000~32767）
 - **Labels / Annotations**：Labels 可被 Selector 篩選，Annotations 僅供人員備註不參與篩選
 - **nodeSelector**：Pod 綁定特定 Node、`Pending` 狀態排查
+- **Health Checks**：`livenessProbe`、`httpGet`（`path`/`port`）、`initialDelaySeconds`、`periodSeconds`、`successThreshold`、`failureThreshold`
+- **Secrets**：`kubectl create secret generic`（`--from-file` / `--from-literal`）、YAML + base64、`secretKeyRef`（環境變數）、`volumes.secret`（掛載檔案）
+- **Demo（Wordpress）**：單一 Pod 內多 container 協作（wordpress + mysql）、`localhost` 溝通、Secret 同時被兩個 container 引用
 
 
 # Day5
@@ -619,6 +625,400 @@ $ kubectl get pods
 - `nodeSelector` 讓 Pod 只被排程到帶有特定 label 的 Node，沒有符合的 Node 時 Pod 會卡在 `Pending`。
 - 下一篇（Day 11）主題：`Health Checks`。
 
+# Day 11
+
+> 參考來源：[[Day 11] 服務中斷了？該怎麼透過 Kubernetes 檢測服務 - Health Checks](https://ithelp.ithome.com.tw/articles/10194846)
+
+## 為什麼需要 Health Checks
+
+Pod 還在 `Running` 不代表裡面的 container 一定正常：container 內的 web app 可能因故停止回應、或資源被其他 container 佔用，導致 request 無法正常處理。Kubernetes 提供 **Health Checks（Probe）** 機制，定期偵測 container 是否還正常運作，異常時自動 restart container。
+
+兩種常見的 health check 方式：
+
+- 定期**透過指令**去訪問 container（exec）
+- 定期**發送一個 HTTP request** 給 container（httpGet）
+
+## 實作：在 Deployment 中加入 livenessProbe
+
+```yaml
+apiVersion: apps/v1beta2 # for kubectl versions >= 1.9.0 use apps/v1
+kind: Deployment
+metadata:
+  name: hello-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-deployment
+  template:
+    metadata:
+      labels:
+        app: my-deployment
+    spec:
+      containers:
+      - name: webapp
+        image: zxcvbnius/docker-demo
+        ports:
+        - name: webapp-port
+          containerPort: 3000
+        livenessProbe:
+          httpGet:
+            path: /
+            port: webapp-port
+          initialDelaySeconds: 15
+          periodSeconds: 15
+          timeoutSeconds: 30
+          successThreshold: 1
+          failureThreshold: 3
+```
+
+**`livenessProbe` 欄位說明**：
+
+| 欄位 | 說明 |
+| --- | --- |
+| `httpGet.path` | health check 要訪問的路徑 |
+| `httpGet.port` | 要訪問的 port（可用 containerPort 的 `name`，這裡是 `webapp-port` = 3000） |
+| `initialDelaySeconds` | container 啟動後，延遲幾秒才開始做 health check |
+| `periodSeconds` | 每隔幾秒訪問一次，預設 `10` 秒 |
+| `successThreshold` | 連續訪問成功幾次，才視為目前 service 正常 |
+| `failureThreshold` | 連續失敗幾次後才判定 container 異常並 restart，預設 `3` 次 |
+
+> 實務上（Production）通常會準備一個專門回應 health check 的 endpoint，例如 `/health`，而不是直接打首頁路徑。
+
+建立並檢查：
+
+```bash
+$ kubectl create -f ./my-deployment-with-health-checks.yaml
+deployment "hello-deployment" created
+
+$ kubectl get deploy
+NAME               DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+hello-deployment   3         3         3            3           23s
+
+$ kubectl describe pod <pod-name>
+# 詳細資料中的 Liveness 欄位，可看到目前 health check 的設定與狀態
+```
+
+當 container 無法正常回應 health check 時，Kubernetes 會視為該 container 失去功能，並自動重啟它。
+
+## 小結
+
+- Health Check（Probe）確保「Pod 狀態正常」跟「裡面的服務真的還在正常回應」是兩回事，前者靠 Kubernetes 排程機制，後者要靠 `livenessProbe` 主動偵測。
+- 本篇示範的是 `httpGet` 方式；另外還有**透過指令（exec）**、**TCP** 定期檢查等方式，屬於同一套機制的不同偵測手段。
+- 下一篇（Day 12）主題：`Secrets`（如何在 Kubernetes 中存放機敏資料）。
+
+# Day 12
+
+> 參考來源：[[Day 12] 敏感的資料怎麼存在k8s?! - Secrets](https://ithelp.ithome.com.tw/articles/10195094)
+
+## 什麼是 Secret
+
+`Secret` 讓開發者能以**非明碼（opaque）**的方式，在 Kubernetes 中存放敏感資訊，例如資料庫帳密、Access Token、SSH Key。Kubernetes 自己也用同一套機制存放 access token，藉此限制外部服務對 API 的存取權限。
+
+存取敏感資料常見的三種方式（今天示範前兩種）：
+
+- 當成**環境變數（environment variables）**使用
+- 掛載（mount）成 Pod 內某個路徑下的檔案
+- 把敏感資料統一包進**私有 Image Registry** 的 image 裡，由 Pod pull image 取得
+
+## 建立 Secret 物件的三種方式
+
+**1. 從檔案匯入**
+
+```bash
+$ echo -n "root" > ./username.txt
+$ echo -n "rootpass" > ./password.txt
+$ kubectl create secret generic demo-secret-from-file \
+  --from-file=./username.txt --from-file=./password.txt
+```
+
+> 若 Secret 是用 `--from-file` 建立，Kubernetes 會把**檔案名稱當成 key、檔案內容當成 value**。
+
+**2. 從指令直接輸入（`--from-literal`）**
+
+```bash
+$ kubectl create secret generic demo-secret-from-literal \
+  --from-literal=username=root \
+  --from-literal=password=rootpass
+```
+
+**3. 透過 YAML 建立**（`data` 底下的值須先用 base64 編碼）
+
+```bash
+$ echo -n "root" | base64        # cm9vdA==
+$ echo -n "rootpass" | base64    # cm9vdHBhc3M=
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: demo-secret-from-yaml
+type: Opaque
+data:
+  username: cm9vdA==
+  password: cm9vdHBhc3M=
+```
+
+```bash
+$ kubectl create -f ./my-secret.yaml
+```
+
+`kubectl get secrets` 除了看到自己建立的 Secret，還會看到 Kubernetes 內建的 `default-token-xxxxx`，裡面存放的 token 是開發者操控 Kubernetes API 用的存取憑證。
+
+## 如何在 Pod 中使用 Secret
+
+**1. 當成環境變數**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+  labels:
+    app: webserver
+spec:
+  containers:
+  - name: demo-pod
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+    env:
+    - name: SECRET_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: demo-secret-from-yaml
+          key: username
+    - name: SECRET_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: demo-secret-from-yaml
+          key: password
+```
+
+**2. 掛載成檔案**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod-with-mounting-secret
+  labels:
+    app: webserver
+spec:
+  containers:
+  - name: demo-pod
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+    volumeMounts:
+    - name: secret-volume
+      mountPath: /etc/creds
+      readOnly: true
+  volumes:
+  - name: secret-volume
+    secret:
+      secretName: demo-secret-from-yaml
+```
+
+### Secret 與 Volume Mount 的關係圖（`demo-secret/my-pod-with-mounting-secret.yaml`）
+
+掛載成檔案的寫法，中間其實經過兩層「同名連結」：先靠 `secretName` 找到是哪一個 Secret，再靠 `volumes` 與 `volumeMounts` 的 `name` 欄位互相對應，才能決定這個 Volume 要接到 container 裡的哪個路徑。
+
+```
+Secret: demo-secret-from-yaml   (demo-secret/my-secret.yaml)
+  data:
+    username: cm9vdA==        ← base64 解碼後 = root
+    password: cm9vdHBhc3M=    ← base64 解碼後 = rootpass
+        │
+        │ ① spec.volumes[].secret.secretName
+        │   指定這個 volume 要對應哪一個 Secret 物件
+        ▼
+Pod: my-pod-with-mounting-secret
+  spec.volumes:
+    - name: secret-volume              ← Volume 在這個 Pod 裡的代稱
+      secret:
+        secretName: demo-secret-from-yaml
+        │
+        │ ② spec.containers[].volumeMounts[].name
+        │   必須與上面 volumes[].name 相同，才能找到同一個 volume
+        ▼
+  spec.containers[0].volumeMounts:
+    - name: secret-volume              ← 對應 volumes 裡的 secret-volume
+      mountPath: /etc/creds            ← 掛載到 container 內的路徑
+      readOnly: true
+        │
+        │ ③ Secret data 底下每個 key，會各自變成 mountPath 下的一個檔案
+        ▼
+  Container: demo-pod
+    /etc/creds/username  →  root       （來自 Secret 的 username）
+    /etc/creds/password  →  rootpass   （來自 Secret 的 password）
+```
+
+**關係摘要**
+
+| 連結 | 欄位 | 說明 |
+| --- | --- | --- |
+| Secret ↔ Volume | `volumes[].secret.secretName` = Secret 的 `metadata.name` | 決定這個 volume 內容來自哪一個 Secret |
+| Volume ↔ Container Mount | `volumeMounts[].name` = `volumes[].name` | 決定 container 要掛載哪一個 volume（純粹是 Pod 內部的名稱對應，跟 Secret 名稱無關） |
+| Secret data ↔ 檔案 | `mountPath` + Secret 的每個 `key` | Secret 裡有幾個 key，`mountPath` 底下就會出現幾個同名檔案，內容是 base64 解碼後的原始值 |
+
+> 對照 [Day 12](#day-12) 「當成環境變數」的寫法會用 `secretKeyRef.key` 只取單一 key；而掛載成檔案這種寫法預設是把整個 Secret 的所有 key 都掛出來，各自變成一個檔案。
+
+建立後可用 `kubectl exec -it <pod> -- /bin/bash` 進入容器，分別用 `echo $SECRET_USERNAME` 或查看 `/etc/creds` 底下的檔案，確認取得的值跟 `demo-secret-from-yaml` 一致。
+
+## 小結
+
+- Secret 建立後，Cluster 內其他有權限的使用者／物件也能存取其中的敏感資料，因此需要搭配 **Service Account** 限制存取範圍（Day 28 `Namespaces` 會再介紹更完整的專案隔離方式）。
+- **勘誤**：base64 只是一種**編碼（encoding）**方式，不是**加密（encryption）**，不能單靠它保護敏感資料的安全性。
+- 下一篇（Day 13）主題：`Demo`——在 minikube 上架設 Stateless Wordpress。
+
+# Day 13
+
+> 參考來源：[[Day 13] 如何在Kubernetes上架設Wordpress？](https://ithelp.ithome.com.tw/articles/10195192)
+
+## 前言
+
+前面幾天（[Day 7](#day-7) Replication Controller、[Day 8](#day-8) Deployment、[Day 9](#day-9) Service、[Day 12](#day-12) Secrets）已經介紹過常用元件，今天把這些元件組合起來，在 minikube 上實際架設一個 **Stateless Wordpress**。
+
+## Wordpress 是什麼
+
+Wordpress 是開源、以 **PHP + MySQL** 為主要架構的建站軟體，官方在 Docker Hub 上提供了 [Wordpress Image](https://hub.docker.com/_/wordpress/) 與 [MySQL Image](https://hub.docker.com/_/mysql/)，兩個 Image 頁面都有列出可設定的環境變數，稍後會透過 Secret 把這些變數傳給 container。
+
+## 實作：在 minikube 上架設 Wordpress
+
+**1. 建立 Secret 存放 DB 密碼**
+
+```yaml
+# wordpress-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wordpress-secret
+type: Opaque
+data:
+  # echo -n "rootpass" | base64
+  db-password: cm9vdHBhc3M=
+```
+
+```bash
+$ kubectl create -f ./wordpress-secret.yaml
+```
+
+**2. 建立 Deployment，一個 Pod 內放兩個 container（wordpress + mysql）**
+
+```yaml
+# my-wordpress-deploy.yaml
+apiVersion: apps/v1beta2
+kind: Deployment
+metadata:
+  name: wordpress-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wordpress-deployment
+  template:
+    metadata:
+      labels:
+        app: wordpress-deployment
+    spec:
+      containers:
+      - name: wordpress
+        image: wordpress:4-php7.0
+        ports:
+        - name: wordpress-port
+          containerPort: 80
+        env:
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-secret
+              key: db-password
+        - name: WORDPRESS_DB_HOST
+          value: 127.0.0.1
+      - name: mysql
+        image: mysql:5.7
+        ports:
+        - name: mysql-port
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-secret
+              key: db-password
+```
+
+重點整理：
+
+- `wordpress` 沒指定 `WORDPRESS_DB_USER` 時，預設以 `root` 帳號連線 MySQL；`mysql` 則用 `MYSQL_ROOT_PASSWORD` 設定 `root` 密碼——只要兩邊密碼一致（都引用同一個 `wordpress-secret` 的 `db-password`），wordpress container 就能以 root 身份連進 mysql container。
+- 兩個 container 在**同一個 Pod** 內，依照 [Day 6](#day-6) 提過的機制共用網路，因此 wordpress 直接用 `WORDPRESS_DB_HOST: 127.0.0.1`（即 `localhost:3306`）就能連到同 Pod 內的 mysql，不需要另外建立 Service。
+- 同一份 Secret（`wordpress-secret`）被兩個 container 分別以 `secretKeyRef` 引用同一個 `key: db-password`，是 Secret 可以「一份多處使用」的實例。
+
+**3. 建立 Service 讓外部瀏覽器能存取**
+
+```yaml
+# wordpress-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress-service
+spec:
+  ports:
+  - port: 3000
+    nodePort: 30300
+    protocol: TCP
+    targetPort: wordpress-port
+  selector:
+    app: wordpress-deployment
+  type: NodePort
+```
+
+```bash
+$ kubectl create -f ./wordpress-service.yaml
+$ kubectl get all                              # 確認所有物件都 READY
+$ minikube service wordpress-service --url     # 取得存取網址
+```
+
+用瀏覽器打開該網址，即可看到 Wordpress 安裝精靈；依序設定語言、網站名稱、使用者帳密後即可登入後台，完成 Blog 架設。
+
+## 關係圖：Pod 內 Secret / Container 溝通
+
+```
+Secret: wordpress-secret
+  data.db-password = "rootpass"（base64 解碼後）
+        │
+        ├── secretKeyRef ──────────────┐
+        │                              │
+        ▼                              ▼
+Pod: wordpress-app-xxxx（同一個 Pod，共用 network / localhost）
+  ┌────────────────────────┐   ┌────────────────────────┐
+  │ container: wordpress   │   │ container: mysql        │
+  │  WORDPRESS_DB_PASSWORD │   │  MYSQL_ROOT_PASSWORD     │
+  │  = db-password         │   │  = db-password           │
+  │  WORDPRESS_DB_HOST     │──▶│  containerPort: 3306     │
+  │  = 127.0.0.1           │   │                          │
+  └────────────────────────┘   └────────────────────────┘
+        ▲
+        │ targetPort: wordpress-port (80)
+        │
+Service: wordpress-service (NodePort 30300)
+        ▲
+        │
+   瀏覽器 http://<minikube-ip>:30300
+```
+
+## 待補足的坑：資料持久化
+
+MySQL 的資料目前存在 container 裡，一旦 Pod crash 或被刪除，後台編輯過的資料會全部遺失——這是本篇示範刻意稱作「**Stateless** Wordpress」的原因。之後 Day 20（`Volumes`）會補上資料持久化的做法。
+
+## 小結
+
+- 這天是把前 12 天學到的元件（Deployment、multi-container Pod、Secret、Service）第一次組合成一個完整可用的應用，練習「元件如何互相配合」而不是學新概念。
+- 重點技巧：**同 Pod 內多 container 靠 `localhost` 溝通**（不需要 Service），以及**同一個 Secret 可以被多個 container 分別引用**。
+- 目前的架設方式資料不會持久化，下一篇（Day 14）主題：`Kubernetes Dashboard` 介紹。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -641,7 +1041,7 @@ $ kubectl get pods
 | --- | --- | --- |
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
 | Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
-| Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通，但尚未介紹 sidecar / init pattern） |
+| Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類） |
 | Utilize persistent and ephemeral volumes | Volume 的使用 | 尚未涉及 |
 
 ## 20% - Application Deployment
@@ -658,7 +1058,7 @@ $ kubectl get pods
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | API deprecations | API 版本淘汰規則 | 尚未涉及 |
-| Probes / health checks | liveness、readiness、startup probe | 尚未涉及 |
+| Probes / health checks | liveness、readiness、startup probe | [Day 11](#day-11)（`livenessProbe`／`httpGet`，尚未涉及 readiness／startup probe） |
 | 使用內建 CLI 工具監控應用 | `kubectl get` / `describe` 等 | [Day 5](#day5)、[Day 6](#day-6)（`kubectl get pods`、`describe pod`、`get nodes` 等） |
 | Container logs | 取得 container log | [Day 5](#day5)（`kubectl attach` 進入 container 查看，非正式 `kubectl logs`） |
 | Debugging in Kubernetes | 除錯技巧 | 尚未涉及 |
@@ -672,7 +1072,7 @@ $ kubectl get pods
 | Requests / limits / quotas | 資源請求與限制 | 尚未涉及 |
 | 定義資源需求（resource requirements） | container resource requirements | 尚未涉及 |
 | ConfigMaps | 設定值管理 | 尚未涉及 |
-| Secrets | 機敏資料管理 | 尚未涉及 |
+| Secrets | 機敏資料管理 | [Day 12](#day-12)（`kubectl create secret`、YAML+base64、環境變數／volume 掛載，尚未涉及搭配 Service Account 限制存取） |
 | ServiceAccounts | 服務帳號 | 尚未涉及 |
 | SecurityContexts / Capabilities | 安全性設定 | 尚未涉及 |
 
@@ -686,7 +1086,7 @@ $ kubectl get pods
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、基本 CLI 監控指令。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 與 `Ingress` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - 佔分最重（25%）的 Environment/Config/Security 幾乎完全尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、Probes 等，是 Day 11 之後應優先加強的重點。
