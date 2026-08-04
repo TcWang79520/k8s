@@ -1,0 +1,29 @@
+apiVersion: apps/v1 # for kubectl versions >= 1.9.0 use apps/v1
+kind: Deployment
+metadata:
+  name: hello-deployment
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-deployment
+  template:
+    metadata:
+      labels:
+        app: my-deployment
+    spec:
+      containers:
+      - name: webapp
+        image: zxcvbnius/docker-demo
+        ports:
+        - name: webapp-port
+          containerPort: 3000
+        livenessProbe:
+          httpGet:
+            path: /
+            port: webapp-port
+          initialDelaySeconds: 15 # 設定當 service 剛啟動時，要延遲幾秒再開始做 health check
+          periodSeconds: 15 # 代表每隔幾秒訪問一次，預設值為 10秒
+          timeoutSeconds: 30  
+          successThreshold: 1 # 可以設置訪問幾次就代表目前 service 還正常運行
+          failureThreshold: 3 # 代表 service 回傳不如預期時，在 Kubernetes 放棄該 container 之前，會嘗試的次數
