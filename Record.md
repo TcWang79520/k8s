@@ -12,6 +12,8 @@
 - [Day 11](#day-11) - Health Checks（Liveness Probe）
 - [Day 12](#day-12) - Secrets（敏感資料管理）
 - [Day 13](#day-13) - Demo：在 minikube 上架設 Stateless Wordpress
+- [Day 17](#day-17) - DNS Service Discovery（kube-dns）
+- [Day 18](#day-18) - ConfigMap（配置與程式碼分離）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -34,6 +36,8 @@
 - **Health Checks**：`livenessProbe`、`httpGet`（`path`/`port`）、`initialDelaySeconds`、`periodSeconds`、`successThreshold`、`failureThreshold`
 - **Secrets**：`kubectl create secret generic`（`--from-file` / `--from-literal`）、YAML + base64、`secretKeyRef`（環境變數）、`volumes.secret`（掛載檔案）
 - **Demo（Wordpress）**：單一 Pod 內多 container 協作（wordpress + mysql）、`localhost` 溝通、Secret 同時被兩個 container 引用
+- **DNS / kube-dns**：`kube-dns` 讓 Pod 之間可透過 Service 名稱（而非動態 Cluster IP）互相溝通、`/etc/resolv.conf` 自動注入 nameserver
+- **ConfigMap**：`kubectl create configmap`（`--from-file` / `--from-literal`）、非機密的部署配置（與 Secret 的機密資料互補）、以 `volumes.configMap` 掛載成檔案供 container 使用
 
 
 # Day5
@@ -474,6 +478,43 @@ spec:
 - **NodePort**：在 ClusterIP 之上，額外於每個 Node 開一個實體 `nodePort`（30000~32767），讓叢集外部也能連進來。
 - **LoadBalancer**：在 NodePort 之上，再由 Cloud Provider 建立一個對外統一的 Load Balancer，自動把流量分散到各個 Node 的 `nodePort`，是三者中最外層、最貼近終端使用者的入口。
 
+## 疊層關係圖：ClusterIP / NodePort / LoadBalancer / port
+
+三種 type 不是三個獨立機制，而是**一層包一層**：`LoadBalancer` 其實也會自動建立 `NodePort`，`NodePort` 也會自動建立 `ClusterIP`——`ClusterIP` 才是所有 Service 都一定會有的最基礎層。每一層各自的 `port` 意義都不同：
+
+```
+外部使用者（瀏覽器 / 手機 App）
+        │
+        │ 只有雲端環境、type=LoadBalancer 才有這一層
+        ▼
+┌────────────────────────────────────────────────┐
+│ LoadBalancer                                     │
+│   對外統一入口： <LB-IP>:port                       │  ← 由 Cloud Provider 建立（如 AWS ELB）
+└─────────────────────┬────────────────────────────┘
+                       │ 自動轉發給叢集內每個 Node 的 nodePort
+                       ▼
+┌────────────────────────────────────────────────┐
+│ NodePort（建立在 ClusterIP 之上）                    │
+│   叢集外部、同一 Node： <NodeIP>:nodePort            │  ← type=NodePort / LoadBalancer 才會開
+└─────────────────────┬────────────────────────────┘
+                       │ 轉發給 Service 自己的 ClusterIP:port
+                       ▼
+┌────────────────────────────────────────────────┐
+│ ClusterIP（三種 type 都一定會有的基礎層）              │
+│   叢集內部： <ClusterIP>:port                       │  ← 未指定 type 時的預設值
+└─────────────────────┬────────────────────────────┘
+                       │ targetPort（轉發到 Pod 實際監聽的 port）
+                       ▼
+┌────────────────────────────────────────────────┐
+│ Pod：container port（例如 3000）                    │
+└────────────────────────────────────────────────┘
+```
+
+看這張圖時，抓住兩個重點：
+
+- **由下往上是「疊加」關係，不是「三選一」**：選 `NodePort` 代表你同時擁有 ClusterIP + NodePort 這兩層；選 `LoadBalancer` 則三層都有。
+- **同一個字「`port`」在不同層代表不同東西**：ClusterIP 那層的 `port` 是叢集內部存取用的埠；LoadBalancer 那層的 `port` 是外部對外統一入口的埠；只有 `nodePort` 跟 `targetPort` 才有自己專屬的欄位名稱，容易搞混的反而是這兩個地方都用 `port` 這個字。
+
 ## 實作重點
 
 ```bash
@@ -520,7 +561,7 @@ $ minikube stop && minikube start --extra-config=apiserver.ServiceNodePortRange=
 
 - Service 的本質是「把 Pod 的動態性，轉換成一個穩定的存取入口」，這跟 [Day 6](#day-6) 提到的 `kube-proxy` 持續把最新的 Pod 清單同步給 `iptables` 是同一件事的兩面：Service/Selector 決定「誰是合法後端」，`kube-proxy`/`iptables` 負責把新連線動態導向這些後端。
 - 也因此可以理解，前面在 [Day 8](#day-8) 討論過的「rollout 後網頁還是舊內容」情境：只要 Service 的 `selector` 沒變，Service 這一層的角色從頭到尾沒變過——真正變動的是 `iptables` 背後那份「目前有效 Pod」清單，以及既有 TCP 連線是否被沿用。
-- Cluster IP 是動態的這件事，也直接點出下一步的真正痛點：如果服務之間（例如 web app 要連 database）都要手動查 IP，一旦 Service 重建 IP 就變了，設定檔就得跟著改。這正是為什麼 Kubernetes 需要 **DNS-based Service Discovery**（用穩定的 Service name 取代易變的 IP），也是原文預告會在 Day 17 深入介紹的主題。
+- Cluster IP 是動態的這件事，也直接點出下一步的真正痛點：如果服務之間（例如 web app 要連 database）都要手動查 IP，一旦 Service 重建 IP 就變了，設定檔就得跟著改。這正是為什麼 Kubernetes 需要 **DNS-based Service Discovery**（用穩定的 Service name 取代易變的 IP），這正是 [Day 17](#day-17) 深入介紹的主題。
 
 ## 小結
 
@@ -1019,6 +1060,460 @@ MySQL 的資料目前存在 container 裡，一旦 Pod crash 或被刪除，後�
 - 重點技巧：**同 Pod 內多 container 靠 `localhost` 溝通**（不需要 Service），以及**同一個 Secret 可以被多個 container 分別引用**。
 - 目前的架設方式資料不會持久化，下一篇（Day 14）主題：`Kubernetes Dashboard` 介紹。
 
+# Day 17
+
+> 參考來源：[[Day 17] Pod 之間是如何找到彼此呢 - DNS Service Discovery](https://ithelp.ithome.com.tw/articles/10195786)
+
+## 前言：為什麼需要 DNS Service Discovery
+
+在 [Day 9](#day-9) 提過，**Service 每次被建立時，Kubernetes Cluster 都會動態給予一組新的 Cluster IP**。當 Cluster 中有多個 Pod 同時運行，各自有自己的 Service，且彼此之間都要靠 Service 互相溝通時，該如何確保在 Cluster IP 動態變動的情況下，Service 之間仍能找到彼此？
+
+Kubernetes 內建一個 `kube-dns` 插件解決了這個問題：**不需要知道 Service 的 Cluster IP，只要透過 Service 的名稱，就能找到相對應的 Pod**。
+
+今天筆記涵蓋：
+
+- DNS 是什麼
+- Kubernetes 內部插件 `kube-dns` 如何運作
+- 實作：把 [Day 13](#day-13) 同一 Pod 內的 wordpress + mysql 拆成兩個獨立 Pod，改用 Service 名稱互相溝通
+
+> 範例程式碼可參考原文附的 [demo-dns](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day17/demo-dns)。
+
+## DNS 是什麼
+
+DNS，全名 **Domain Name System**。DNS 內部維護一張表格，紀錄每個 domain name 對應的 IP 位址，讓使用者不需要記住服務的 IP，而是透過網域名稱就能連上服務（例如瀏覽器輸入 `www.google.com.tw` 時，DNS 會找到對應 IP 並完成連線）。若想查詢某個網域對應的 IP，可在終端機使用 `host` 指令。
+
+## kube-dns 如何運作
+
+Kubernetes 本身提供 DNS 套件 `kube-dns`，讓**同一個 Kubernetes Cluster 中的所有 Pod，都能透過 Service 的名稱找到彼此**。透過 `kubectl get` 可以看到 `kube-dns` 本身也是 Cluster 中運行的一個服務，Cluster 建立後就會自動運行。
+
+- `kube-dns` 的相關設定檔放在 **master node 的 `/etc/kubernetes/addons`** 資料夾底下；以 minikube 為例，minikube 的 VM 本身就是 master node，可用 `minikube ssh` 登入查看。
+- `kube-dns` 是運行在 Cluster 中的一個 Pod，也有對應的 Service 物件。
+- **Kubernetes 在每個 Pod 建立時，都會自動在該 Pod 的 `/etc/resolv.conf` 中加入 `kube-dns` Service 的 domain name 與對應 IP**。因此其他 Pod 可以透過名為 `kube-dns` 的 Service 物件，找到正在運行的 `kube-dns`。
+
+```bash
+# 進入 alpine Pod 的 shell 後查看
+$ cat /etc/resolv.conf
+# nameserver 指向的 IP，就是 kube-dns 這個 Service 的 Cluster IP
+```
+
+> 若對 `alpine` Pod 操作不熟悉，可參考 [Day 5](#day5) 常用 kubectl 指令。
+
+## 實作：把 Wordpress 拆成兩個 Pod，透過 Service 名稱溝通
+
+[Day 13](#day-13) 是把 wordpress 與 mysql 放在**同一個** Pod 裡，靠 `localhost` 溝通。這次改成拆成**兩個獨立 Pod**，各自建立 Service，wordpress 改用 mysql Service 的**名稱**（而非 IP）連線，驗證 `kube-dns` 是否真的能讓兩個 Pod 找到彼此。
+
+會用到 5 個設定檔：`mysql-secret.yaml`、`mysql-server-pod.yaml`、`mysql-server-service.yaml`、`wordpress-pod.yaml`、`wordpress-service.yaml`。
+
+### 1. 建立 Secret（存放 DB 密碼）
+
+```yaml
+# mysql-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+type: Opaque
+data:
+  # echo -n "rootpass" | base64
+  db-root-password: cm9vdHBhc3M=
+```
+
+```bash
+$ kubectl create -f ./mysql-secret.yaml
+secret "mysql-secret" created
+```
+
+### 2. 建立 MySQL Server（獨立 Pod + Service）
+
+```yaml
+# mysql-server-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-server
+  labels:
+    app: mysql-server
+spec:
+  containers:
+  - name: mysql-server
+    image: mysql:5.7
+    ports:
+    - name: mysql-port
+      containerPort: 3306
+    env:
+    - name: MYSQL_ROOT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: mysql-secret
+          key: db-root-password
+```
+
+```yaml
+# mysql-server-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-server-service
+spec:
+  ports:
+  - port: 3306
+    protocol: TCP
+  selector:
+    app: mysql-server
+  type: NodePort
+```
+
+```bash
+$ kubectl create -f ./mysql-server-pod.yaml
+pod "mysql-server" created
+
+$ kubectl create -f ./mysql-server-service.yaml
+service "mysql-server-service" created
+```
+
+### 3. 建立 Wordpress App（獨立 Pod + Service）
+
+```yaml
+# wordpress-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wordpress
+  labels:
+    app: wordpress
+spec:
+  containers:
+  - name: wordpress
+    image: wordpress:4-php7.0
+    ports:
+    - name: wordpress-port
+      containerPort: 80
+    env:
+    - name: WORDPRESS_DB_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: mysql-secret
+          key: db-root-password
+    - name: WORDPRESS_DB_HOST
+      value: mysql-server-service
+```
+
+關鍵在 `WORDPRESS_DB_HOST` 這裡，值直接填 **`mysql-server-service`（Service 名稱）**，而不是任何 IP——這就是 `kube-dns` 實際發揮作用的地方。
+
+```yaml
+# wordpress-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress-service
+spec:
+  ports:
+  - port: 3000
+    nodePort: 30300
+    protocol: TCP
+    targetPort: wordpress-port
+  selector:
+    app: wordpress
+  type: NodePort
+```
+
+```bash
+$ kubectl create -f wordpress-pod.yaml && \
+  kubectl create -f wordpress-service.yaml
+pod "wordpress" created
+service "wordpress-service" created
+
+$ kubectl get all   # 確認所有物件都是 Ready 狀態
+
+$ minikube service wordpress-service --url
+http://192.168.99.100:30300
+```
+
+瀏覽器打開該網址即可看到 Wordpress 歡迎頁面；設定好帳密進入後台編輯內容，再進 mysql server 查看，可以看到 database 內容確實同步更新，證明兩個獨立 Pod 之間透過 Service 名稱成功溝通。
+
+> **原文備註**：讀者 @iming0319 曾勘誤原文一處筆誤——建立物件應為 `kubectl create` 而非 `kubectl get`（`kubectl get` 是查詢，不會建立物件）。
+
+## 關係圖：兩個獨立 Pod 如何透過 kube-dns 找到彼此
+
+```
+Pod: wordpress                              Pod: mysql-server
+  container: wordpress                        container: mysql-server
+  env.WORDPRESS_DB_HOST                        containerPort: 3306
+    = "mysql-server-service"  ──┐
+                                 │  ① wordpress 不用 IP，直接用 Service 名稱
+                                 ▼
+                    Service: mysql-server-service
+                    (selector: app=mysql-server)
+                                 ▲
+                                 │  ② kube-dns 把 Service 名稱解析成
+                                 │     mysql-server-service 目前的 Cluster IP
+                    ┌────────────────────────────┐
+                    │ kube-dns（Cluster 內建服務）   │
+                    │  - 建立 Pod 時自動寫入該 Pod 的 │
+                    │    /etc/resolv.conf          │
+                    └────────────────────────────┘
+```
+
+## 補充：搞懂 Service Port / Pod Port / targetPort / nodePort
+
+這幾個「port」很容易搞混，因為**四個都叫 port，卻是四個不同層級的東西**。用專案裡實際的 [`demo-wordpress-diff-pods/wordpress-pod.yaml`](demo-wordpress-diff-pods/wordpress-pod.yaml) 跟 [`demo-wordpress-diff-pods/wordpress-service.yaml`](demo-wordpress-diff-pods/wordpress-service.yaml) 這兩個檔案來對照最清楚：
+
+```yaml
+# wordpress-pod.yaml（節錄）
+spec:
+  containers:
+  - name: wordpress
+    image: wordpress:4-php7.0
+    ports:
+    - name: wordpress-port     # ← 幫這個 port 取名字，讓 Service 可以用名字引用它
+      containerPort: 80        # ← ① Pod Port：container 裡的 wordpress 實際監聽的 port
+```
+
+```yaml
+# wordpress-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress-service-diff
+spec:
+  ports:
+  - port: 3000                 # ← ③ Service Port：Service 自己（ClusterIP）對外的 port
+    nodePort: 30301             # ← ④ nodePort：開在每個 Node 實體 IP 上的 port
+    protocol: TCP
+    targetPort: wordpress-port # ← ② targetPort：Service 要把流量轉給 Pod 的哪個 port
+  selector:
+    app: wordpress             # ← 靠這個 label 找到 wordpress Pod
+  type: NodePort
+```
+
+**逐一拆解**
+
+| # | 欄位 | 這個範例的值 | 定義在哪 | 意義 |
+| --- | --- | --- | --- | --- |
+| ① | **Pod Port**（`containerPort`） | `80` | Pod 的 yaml，`containers[].ports[].containerPort` | container 裡的應用程式**實際監聽**的 port。這是唯一「真正在跑」的 port，其他三個都只是**轉發規則**，指向這個 port。 |
+| ② | **targetPort** | `wordpress-port`（= 80） | Service 的 yaml，`spec.ports[].targetPort` | Service 要把流量轉給 Pod 的哪個 port。可以直接寫數字 `80`，也可以像這個範例一樣寫 container port 的**名字**（`wordpress-port`），Kubernetes 會自動查表對應回 `80`。這個值**必須**跟 Pod 實際監聽的 port 一致，否則轉發過去 Pod 也不會回應。 |
+| ③ | **Service Port**（`port`） | `3000` | Service 的 yaml，`spec.ports[].port` | Service 自己對外的 port——Cluster 內其他 Pod 要打 `<ClusterIP>:3000` 才能連到這個 Service。注意這裡故意跟 `targetPort` 的 `80` 不同數字，就是要凸顯**這兩個是完全獨立的欄位**，`port` 給「叫用 Service 的人」用，`targetPort` 給「Service 轉發給 Pod」用，彼此不必相同。 |
+| ④ | **nodePort** | `30301` | Service 的 yaml，`spec.ports[].nodePort` | 因為 `type: NodePort`，Kubernetes 額外在**每個 Node 的實體 IP** 上開一個 port（範圍 30000~32767，見 [Day 9](#day-9)），讓叢集外部（例如你的瀏覽器）能直接打 `<NodeIP>:30301` 連進來。 |
+
+**完整流量路徑圖（帶入實際數值）**
+
+```
+瀏覽器（叢集外部）
+        │
+        │  打 http://<NodeIP>:30301
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│ Node (minikube VM)                                         │
+│                                                             │
+│   nodePort: 30301  ◄── ④ type=NodePort 才會開這個實體 port    │
+│        │                                                    │
+│        ▼                                                    │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Service: wordpress-service-diff                       │   │
+│  │   ClusterIP: 10.x.x.x                                  │   │
+│  │   port: 3000        ◄── ③ 叢集內部打這個 port找到 Service │   │
+│  │   selector: app=wordpress  ◄── 靠 label 選中下面的 Pod   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│        │                                                     │
+│        ▼ targetPort: wordpress-port（= 80）                   │
+│        （② Service 轉發流量到 Pod 實際監聽的 port）              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Pod: wordpress                                         │   │
+│  │   container: wordpress                                 │   │
+│  │   containerPort: 80  ◄── ① 唯一「真正在跑」的 port         │   │
+│  └─────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────┘
+```
+
+**一句話總結**：只有 **①`containerPort`（Pod Port）** 是應用程式真正監聽的 port，其餘 **②`targetPort`、③`port`、④`nodePort`** 都只是不同層級（Service→Pod、叢集內部、叢集外部）的「轉發規則」，各自可以取完全不同的數字，只要 `targetPort` 對得上 `containerPort` 即可正常運作。這張圖跟 [Day 9](#day-9) 的存取路徑對照表是同一件事，只是這裡換成專案裡 `demo-wordpress-diff-pods` 的真實數值，方便直接對照 yaml 檔案理解。
+
+## 我的想法
+
+- 這一天把 [Day 9](#day-9) 留下的痛點（Cluster IP 動態分配、服務間溝通要手動查 IP）直接解決掉：只要 Service 名稱不變，背後 Cluster IP 怎麼變都不影響 Pod 之間的溝通，這正是 Service 名稱 + `kube-dns` 組合出的「穩定服務發現」。
+- 跟 [Day 13](#day-13) 對照最能感受差異：同一個 Pod 內用 `localhost` 溝通（[Day 6](#day-6) 提過的機制）跟跨 Pod 用 Service 名稱溝通，是兩種不同層級的服務發現手段——前者靠共享網路命名空間，後者靠 `kube-dns` 解析。也因此，把原本耦合在同一 Pod 的 wordpress + mysql 拆開成兩個 Pod，才更貼近實務上「每個服務獨立部署、獨立擴展」的做法。
+
+## 小結
+
+- `kube-dns` 讓 Cluster 內的 Pod 可以用 **Service 名稱**取代**動態 Cluster IP**互相溝通，是 Kubernetes 內建、Cluster 建立後自動運行的服務發現機制。
+- 每個 Pod 建立時，Kubernetes 會自動把 `kube-dns` 的位址寫進該 Pod 的 `/etc/resolv.conf`，因此 Pod 內對 Service 名稱的查詢都會先經過 `kube-dns` 解析。
+- 本篇把 [Day 13](#day-13) 單一 Pod 內的 wordpress + mysql 拆成兩個獨立 Pod，驗證只要 Service 名稱固定，即使 Cluster IP 變動，Pod 之間仍能正常溝通。
+
+# Day 18
+
+> 參考來源：[[Day 18] 高彈性部署 Application - ConfigMap](https://ithelp.ithome.com.tw/articles/10196153)
+
+## 前言：為什麼需要 ConfigMap
+
+開發時常見的一個錯誤，是把「部署環境的設定（configuration）」跟「程式碼」一起交付——例如把 `development` / `staging` / `production` 各環境的設定寫死在程式碼裡。這麼做的風險是：**只要有人存取到程式碼，就等於拿到各環境的敏感資料**。
+
+[12 factor](https://12factor.net/config) 對此提出的解法是：**把配置存在環境變數中**，降低 Configuration 與程式碼的耦合。但配置與程式碼分開之後，又會遇到新問題：配置**散落各地**，需要一個地方統一管理；而且不同程式語言、不同服務的配置格式又常常不一樣，統一管理更加困難。
+
+Kubernetes 提供的 `ConfigMap` API，就是用來**統一存放 Configuration**，並讓開發者能以**動態、代碼化**的方式為每個應用服務配置對應的設定。
+
+今天筆記涵蓋：
+
+- 定義什麼是 Configuration
+- 比較 ConfigMap 與 [Secret](#day-12) 的差別
+- 介紹 ConfigMap 的建立方式
+- 實作：透過 ConfigMap 配置 Nginx，把流量導到 [Day 3](https://ithelp.ithome.com.tw/articles/10192519) 打造的 Node.js App
+
+> 範例程式碼可參考原文附的 [demo-configmap](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day18/demo-configmap)。
+
+## 什麼是 Configuration
+
+Configuration 泛指**程式存取外部資源或部署所需的資料**，例如資料庫的所在 IP、管理者的帳號密碼，或是 Nginx 的設定檔。一旦這些資料被不小心存取（例如資料庫被刪除或公開），可能讓專案陷入危險，或損害服務使用者的權益。
+
+## ConfigMap 與 Secret 的差別
+
+[Day 12](#day-12) 介紹過的 `Secret`，跟今天的 `ConfigMap` 想解決的面向不同：
+
+| | 存放內容 | 範例 | 是否編碼 |
+| --- | --- | --- | --- |
+| **Secret** | 機密資料 | API Token、database 密碼 | 值會經過 Base64 編碼 |
+| **ConfigMap** | 非機密、屬於部署面的資料 | 資料庫的 port number、Redis 的 config file | 不編碼，明碼存放 |
+
+## ConfigMap 特點
+
+- **一個 ConfigMap 物件可以存入整個 configuration**，例如 webserver 或 Nginx 的 config file。
+- **無需修改 container 程式碼，就能替換不同環境的 Config**——開發過程中常因應 `staging` / `production` 等不同環境，需要不同的資料庫位址等設定，這種做法能加快跨環境部署的速度。
+- **統一存放所有的 configuration**，可透過 `kubectl get` 快速查看目前系統所有的 ConfigMap。
+
+## 建立 ConfigMap 的兩種方式
+
+**1. 匯入整個 config 檔（`--from-file`）**
+
+以 [Redis](https://redis.io/) 的 config file 為例：
+
+```
+# my-redis.conf
+bind 127.0.0.1
+port 6379
+maxclients 10000
+maxmemory 50mb
+maxmemory-policy volatile-lru
+syslog-enabled yes
+dir /var/lib/redis
+dbfilename redis.dump.rdb
+databases 1
+appendfsync everysec
+save 600 10
+```
+
+```bash
+$ kubectl create configmap redis-config --from-file=my-redis.conf
+configmap "redis-config" created
+```
+
+建立後可用 `kubectl get configmap` 查看清單，`kubectl describe configmap redis-config` 可看到 `my-redis.conf` 完整內容。
+
+**2. 從指令直接設定（`--from-literal`）**
+
+```bash
+$ kubectl create configmap mysql-host --from-literal=ip=127.0.0.1
+configmap "mysql-host" created
+```
+
+同樣可用 `kubectl describe configmap mysql-host` 查看內容。
+
+**刪除 ConfigMap**：
+
+```bash
+$ kubectl delete configmap mysql-host
+configmap "mysql-host" deleted
+```
+
+## 實作：透過 ConfigMap 配置 Nginx
+
+今天的實作會用 ConfigMap 配置一個 Nginx Service，讓 Nginx 收到 request 後，把流量導向 [Day 3](https://ithelp.ithome.com.tw/articles/10192519) 打造的 Node.js App。
+
+**什麼是 Nginx**：Nginx 不只是輕量的 HTTP 伺服器，同時也是一個**反向代理**伺服器——收到用戶請求後，把流量導給後端 service，再把後端處理好的資源回傳給前端使用者。
+
+### 1. 準備 Nginx 設定檔並建立 ConfigMap
+
+```
+# my-nginx.conf
+server {
+    listen            80;
+    server_name       localhost;
+
+    location / {
+        proxy_bind 127.0.0.1;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    error_page 500 502 503 504    /50x.html;
+    location = /50x.html {
+        root    /usr/share/nginx/html;
+    }
+}
+```
+
+```bash
+$ kubectl create configmap nginx-conf --from-file=./my-nginx.conf
+configmap "nginx-conf" created
+```
+
+### 2. 建立 Pod，掛載 ConfigMap 供 Nginx container 使用
+
+```yaml
+# my-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apiserver
+  labels:
+    app: webserver
+    tier: backend
+spec:
+  containers:
+  - name: nodejs-app
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+  - name: nginx
+    image: nginx:1.13
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: nginx-conf-volume
+      mountPath: /etc/nginx/conf.d
+  volumes:
+  - name: nginx-conf-volume
+    configMap:
+      name: nginx-conf
+      items:
+      - key: my-nginx.conf
+        path: my-nginx.conf
+```
+
+這個 Pod 跟 [Day 13](#day-13) 一樣是 multi-container 設計：`nodejs-app` container 監聽 3000 port（[Day 3](https://ithelp.ithome.com.tw/articles/10192519) 的 Node.js App），`nginx` container 監聽 80 port 並反向代理到 `127.0.0.1:3000`；`nginx-conf` 這份 ConfigMap 則透過 `volumes.configMap` 掛載到 `nginx` container 的 `/etc/nginx/conf.d` 路徑下，掛載方式與 [Day 12](#day-12) Secret 掛載成檔案的寫法（`volumes[].name` ↔ `volumeMounts[].name` 對應）幾乎一致，差別只在 `volumes[].configMap` 換掉了 `volumes[].secret`，並多了 `items` 指定 key 對應的檔名。
+
+```bash
+$ kubectl create -f ./my-pod.yaml
+pod "apiserver" created
+
+$ kubectl get pods    # 確認 apiserver 狀態為 Ready
+
+$ kubectl expose pod apiserver --port=80 --type=NodePort
+service "apiserver" exposed
+
+$ minikube service apiserver --url
+http://192.168.99.100:31529
+```
+
+瀏覽器打開該網址後看到 `Hello World!` 字串，代表請求成功經 Nginx 反向代理到 Node.js App，也證明 ConfigMap 成功掛載在 Nginx Pod 上。
+
+## 我的想法
+
+- ConfigMap 跟 [Day 12](#day-12) Secret 掛載成檔案的機制幾乎是同一套（`volumes` + `volumeMounts` 名稱對應），差別純粹在**用途**：Secret 存機密、會 base64 編碼；ConfigMap 存非機密的部署配置、明碼存放。理解了其中一個，另一個幾乎是直接套用。
+- 這天的 Nginx + Node.js 範例，也再次用到 [Day 6](#day-6) 提過的「同 Pod 內 container 共用網路」機制——`nginx` container 直接用 `proxy_pass http://127.0.0.1:3000` 打到同 Pod 內的 `nodejs-app` container，不需要另外建立 Service，跟 [Day 13](#day-13) wordpress 連 mysql 的手法如出一轍。
+
+## 小結
+
+- ConfigMap 用來統一存放**非機密**的部署配置（跟 [Day 12](#day-12) Secret 存放機密資料互補），可透過 `--from-file` 匯入整個設定檔，或 `--from-literal` 直接指定單一 key/value。
+- 掛載方式與 Secret 相同，都是透過 `volumes` + `volumeMounts` 把內容掛成 container 內的檔案。
+- 下一篇（Day 20）主題：`Volumes`——如何讓 Pod 的資料持久化（呼應 [Day 13](#day-13) 尾聲提到「Stateless Wordpress 資料不持久化」的待補坑）。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -1071,7 +1566,7 @@ MySQL 的資料目前存在 container 裡，一旦 Pod crash 或被刪除，後�
 | Authentication / Authorization / Admission Control | 認證授權機制 | 尚未涉及 |
 | Requests / limits / quotas | 資源請求與限制 | 尚未涉及 |
 | 定義資源需求（resource requirements） | container resource requirements | 尚未涉及 |
-| ConfigMaps | 設定值管理 | 尚未涉及 |
+| ConfigMaps | 設定值管理 | [Day 18](#day-18)（`kubectl create configmap`、`--from-file`/`--from-literal`、`volumes.configMap` 掛載成檔案） |
 | Secrets | 機敏資料管理 | [Day 12](#day-12)（`kubectl create secret`、YAML+base64、環境變數／volume 掛載，尚未涉及搭配 Service Account 限制存取） |
 | ServiceAccounts | 服務帳號 | 尚未涉及 |
 | SecurityContexts / Capabilities | 安全性設定 | 尚未涉及 |
@@ -1081,12 +1576,13 @@ MySQL 的資料目前存在 container 裡，一旦 Pod crash 或被刪除，後�
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | NetworkPolicies | 網路流量控管規則 | 尚未涉及 |
-| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制） |
+| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制）、[Day 17](#day-17)（`kube-dns`：Pod 之間透過 Service 名稱互相溝通，不受 Cluster IP 動態變動影響） |
 | Ingress | 對外路由規則 | 尚未涉及 |
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 與 `Ingress` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
-- 佔分最重（25%）的 Environment/Config/Security 幾乎完全尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、Probes 等，是 Day 11 之後應優先加強的重點。
+- **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe 等，是後續應優先加強的重點。
