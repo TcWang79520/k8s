@@ -15,6 +15,7 @@
 - [Day 17](#day-17) - DNS Service Discovery（kube-dns）
 - [Day 18](#day-18) - ConfigMap（配置與程式碼分離）
 - [Day 19](#day-19) - Ingress 與 Ingress Controller（負載平衡）
+- [Day 20](#day-20) - Volumes（資料持久化：emptyDir / hostPath / Cloud Storage / NFS）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -40,6 +41,7 @@
 - **DNS / kube-dns**：`kube-dns` 讓 Pod 之間可透過 Service 名稱（而非動態 Cluster IP）互相溝通、`/etc/resolv.conf` 自動注入 nameserver
 - **ConfigMap**：`kubectl create configmap`（`--from-file` / `--from-literal`）、非機密的部署配置（與 Secret 的機密資料互補）、以 `volumes.configMap` 掛載成檔案供 container 使用
 - **Ingress / Ingress Controller**：統一對外 port、以路徑（path）或 domain name 導流到不同 Service、SSL termination、Ingress Controller（Nginx/GCE）才是真正實現負載平衡的元件
+- **Volumes**：讓 container 資料持久化（stateless → stateful）、四種常用類型 `emptyDir`（隨 Pod 生滅）/ `hostPath`（隨 Node 生滅）/ Cloud Storage（AWS EBS 等）/ `NFS`、`volumes` + `volumeMounts` 掛載機制
 
 
 # Day5
@@ -1924,6 +1926,202 @@ $ minikube ip
 - **API 版本勘誤**：本篇所有 Ingress yaml 已從原文的 `extensions/v1beta1` 更新為現行的 `networking.k8s.io/v1`（`backend.serviceName/servicePort` → `backend.service.name/port.number`，並新增必填的 `pathType`），可對照 [`demo-ingress/ingress-example-1.yaml`](demo-ingress/ingress-example-1.yaml) 驗證。
 - **安裝方式勘誤**：原文手動 `curl` 拆開的多個 ingress-nginx 部署 yaml（`namespace.yaml`/`default-backend.yaml`/`configmap.yaml`/`without-rbac.yaml`⋯）路徑已全數失效，官方已整併成單一安裝檔。這份筆記的環境（minikube）改用 `minikube addons enable ingress` 一行指令安裝，等同於裝好最新版的 Ingress Controller、ConfigMap、Service、RBAC。
 
+# Day 20
+
+> 參考來源：[[Day 20] 如何保存 Container 中資料 - Volumes](https://ithelp.ithome.com.tw/articles/10196428)
+
+## 前言：為什麼需要 Volumes
+
+前面幾天用到的 Pod 都是 [Stateless](#day-13) 的：**container 儲存的資料，會隨著 container 的生命週期消失而一併消失**，這也是 [Day 13](#day-13) 尾聲留下的坑——「Stateless Wordpress」在後台編輯過的內容，一旦 Pod crash 或被刪除就全部遺失。今天要介紹的 `Volumes`，就是用來打造 **Stateful** Pod 的機制：即便 Pod 中的 container 因故 crash，資料仍可完整保存，讓新產生的 container 能接續使用。
+
+今天筆記涵蓋：
+
+- 介紹什麼是 Volumes（四種常用類型）
+- 實作：在 AWS Kubernetes Cluster 上綁定 AWS EBS Volumes
+
+> 範例程式碼可參考原文附的 [demo-volumes](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day20/demo-volumes)。
+
+## 什麼是 Volumes
+
+`Volumes` 是 Kubernetes Cluster 中專門用來**儲存資料**的地方，不只能把 container 的資料保存下來，也能透過**掛載（mounting）**的方式供多個 Pod 同時存取。Kubernetes 支援非常多種 Volume 類型，今天筆記介紹四種常用的：`emptyDir`、`hostPath`、Cloud Storage、NFS。
+
+### emptyDir
+
+每建立一個新 Pod，Kubernetes 就會在該 Pod 裡建立一個 `emptyDir`，**該 Pod 中所有 container 都可以讀寫這個目錄**。當 Pod 從 Node 中被移除時，`emptyDir` 也會隨之消失。常見用途：
+
+- **暫時性儲存空間**：某些應用程式運行時需要臨時、無需永久保存的資料夾。
+- **共用儲存空間**：同一 Pod 內所有 container 都能讀寫 `emptyDir`，可當作這些 container 的共用目錄（跟 [Day 6](#day-6)、[Day 13](#day-13) 提過的「同 Pod 內 container 共用網路可用 `localhost` 溝通」是類似概念，只是這裡共用的是檔案系統而非網路）。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pd
+spec:
+  containers:
+  - image: k8s.gcr.io/test-webserver
+    name: test-container
+    volumeMounts:
+    - mountPath: /cache
+      name: cache-volume
+  volumes:
+  - name: cache-volume
+    emptyDir: {}
+```
+
+### hostPath
+
+在 Pod 上掛載 **Node** 的資料夾或檔案。**`hostPath` 的生命週期與 Node 相同**：Pod 因故重啟時，檔案仍保存在 Node 的檔案系統底下，直到該 Node 物件被 Kubernetes Cluster 移除，資料才會消失。
+
+```yaml
+# hostpath-example.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apiserver
+spec:
+  containers:
+  - name: apiserver
+    image: zxcvbnius/docker-demo
+    volumeMounts:
+    - mountPath: /tmp
+      name: tmp-volume
+    imagePullPolicy: Always
+  volumes:
+  - name: tmp-volume
+    hostPath:
+      path: /tmp
+      type: Directory
+```
+
+這個 yaml 把 **Node 的 `/tmp` 掛在 `apiserver` 的 `/tmp` 下**，兩者存取相同資源：apiserver 的 `/tmp` 新增檔案，可以從 Node 的 `/tmp` 底下找到同一個檔案。
+
+```bash
+$ kubectl create -f ./hostpath-example.yaml
+pod "apiserver" created
+```
+
+進到 `apiserver` 的 shell 中，在 `/tmp` 新增一個 `test.txt`；接著進到 `minikube` 的 shell（`minikube ssh`），可以在 Node 的 `/tmp` 底下找到同一個 `test.txt`。若該 Pod 被刪除，檔案仍會保存在 Node 的 `/tmp/test.txt` 中，供新的 Pod 物件使用。
+
+### Cloud Storage
+
+Kubernetes 也支援 AWS EBS、Google Disk、Microsoft Azure Disk 等雲端硬碟類型的 Volumes；今天的實作會示範如何把 AWS EBS 掛載在（架設於 AWS 的）Kubernetes Cluster 的 Pod 上。
+
+### NFS（Network FileSystem）
+
+```yaml
+# nfs-example.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apiserver
+spec:
+  containers:
+  - name: apiserver
+    image: zxcvbnius/docker-demo
+    ports:
+      - name: api-port
+        containerPort: 3000
+    volumeMounts:
+      - name: nfs-volumes
+        mountPath: /tmp
+  volumes:
+  - name: nfs-volumes
+    nfs:
+      server: {YOUR_NFS_SERVER_URL}
+      path: /
+```
+
+> 更多 Kubernetes NFS 範例可參考[該連結](https://github.com/kubernetes/examples/tree/master/staging/volumes/nfs)。
+
+## 實作：在 AWS Kubernetes Cluster 上綁定 AWS EBS Volumes
+
+> 若還不熟悉怎麼在 AWS 上架設 Kubernetes，可先參考原文的 [Day 15] 介紹 kops 系列文章。
+
+**1. 用 `aws-cli` 建立一個 1GB 的 EBS（Oregon 區域）**
+
+```bash
+$ aws ec2 create-volume \
+  --size 1 \
+  --region us-west-2 \
+  --availability-zone us-west-2a \
+  --volume-type gp2
+
+{
+    "VolumeId": "vol-0b29e0a08749ccef3",
+    "SnapshotId": "",
+    "Size": 1,
+    "VolumeType": "gp2",
+    "State": "creating",
+    "Iops": 100,
+    "CreateTime": "2018-01-08T04:38:58.885Z",
+    "AvailabilityZone": "us-west-2a",
+    "Encrypted": false
+}
+```
+
+AWS 提供 5 種不同類型的 Volumes，這裡使用**一般用途的 SSD（gp2）**。可以在 AWS Console 的 EC2 頁面，或用 `aws ec2 describe-volumes --region us-west-2` 查詢剛建立的 EBS 詳細資料。
+
+**2. 建立 Pod，掛載該 EBS**
+
+```yaml
+# aws-ebs-example.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apiserver
+spec:
+  containers:
+  - name: apiserver
+    image: zxcvbnius/docker-demo
+    ports:
+      - name: api-port
+        containerPort: 3000
+    volumeMounts:
+      - name: aws-ebs-volumes
+        mountPath: /tmp
+  volumes:
+  - name: aws-ebs-volumes
+    awsElasticBlockStore:
+      # replace to your volumeID
+      volumeID: vol-0b29e0a08749ccef3
+```
+
+這裡希望 `vol-0b29e0a08749ccef3` 掛載在 `apiserver` 的 `/tmp` 資料夾底下。
+
+```bash
+$ kubectl create -f ./aws-ebs-example.yaml
+pod "apiserver" created
+
+$ kubectl describe pod apiserver
+...
+Volumes:
+  aws-ebs-volumes:
+    Type:       AWSElasticBlockStore
+    VolumeID:   vol-0b29e0a08749ccef3
+```
+
+`kubectl describe` 的 `Volumes` 欄位可以看到掛載的 `vol-0b29e0a08749ccef3`。之後在 `apiserver` 的 `/tmp` 底下新增或修改的檔案都會存放在 EBS 中，即便 `apiserver` 這個 Pod 不存在了，下次新建的 Pod 一樣可以從 `vol-0b29e0a08749ccef3` 找回資料。
+
+**限制**：**AWS EBS 只能被綁定在 EC2 上**，也就是 Node 一定要架設在 AWS 上，才能綁定 EBS。
+
+> **勘誤（in-tree volume plugin 已淘汰）**：原文示範的 `volumes.awsElasticBlockStore` 寫法屬於 Kubernetes **in-tree（內建）volume plugin**，自 Kubernetes 1.17 起已標示為 deprecated，並自 1.23 起預設透過 **CSI migration** 機制在背後轉譯給 [AWS EBS CSI Driver](https://github.com/kubernetes-sigs/aws-ebs-csi-driver) 處理；較新版本的 Cluster（尤其是 EKS 1.23+）需要額外安裝 `aws-ebs-csi-driver` 這個 add-on，`awsElasticBlockStore` 欄位才能正常運作。這也是這系列筆記另一個「yaml 語法還能寫、但背後執行方式已經演進」的例子，跟 [Day 19](#day-19) Ingress API 版本、安裝方式過期是同一類坑，實際操作前建議查對應 Cluster 版本的官方文件。
+>
+> 另外，這一天的實作**需要真實架在 AWS 上的 Kubernetes Cluster**（EBS 只能掛給同區域的 EC2 Node），無法直接在本機 minikube 上重現，這點與前面幾天大多可以純用 minikube 操作不同。
+
+## 我的想法
+
+- 這天正式補上 [Day 13](#day-13) 尾聲留下的坑：Stateless Wordpress 資料不持久化的問題，答案就是 `Volumes`——只要把 MySQL 的資料目錄改成掛載 `hostPath` 或 Cloud Storage（如 AWS EBS），Pod 重建後資料依然存在，就能把「Stateless Wordpress」升級成「Stateful Wordpress」。
+- `emptyDir` / `hostPath` / Cloud Storage 三者的生命週期是一條漸進的光譜：`emptyDir` 跟著 **Pod** 生滅（最短命）、`hostPath` 跟著 **Node** 生滅（中等）、Cloud Storage（如 AWS EBS）則完全獨立於 Pod 和 Node 之外，只要不手動刪除就會一直存在（最持久）。选型時要依「這份資料需要活多久」來決定用哪一種。
+- `volumes` + `volumeMounts` 這套掛載機制，跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案的寫法完全同構（`volumes[].name` ↔ `volumeMounts[].name` 對應），只是這次 `volumes[]` 底下換成 `emptyDir` / `hostPath` / `awsElasticBlockStore` / `nfs` 等不同的資料來源類型而已——理解了其中一種掛載方式，其餘幾種幾乎是直接代換。
+
+## 小結
+
+- `Volumes` 讓 container 的資料能在 Pod／Node 重建後依然保留，是把 Stateless 應用改造成 Stateful 應用的關鍵機制。
+- 四種常用類型：`emptyDir`（隨 Pod 生滅，可當暫存或同 Pod 內 container 共用空間）、`hostPath`（隨 Node 生滅）、Cloud Storage（如 AWS EBS，獨立於 Pod/Node 之外，但只能掛給同雲端服務商的機器）、`NFS`。
+- 本篇實作示範用 `aws-cli` 建立 AWS EBS，再透過 `volumes.awsElasticBlockStore` 掛載到 Pod；**原文所用的 in-tree plugin 寫法目前已 deprecated，新版 Cluster 需搭配 AWS EBS CSI Driver 才能運作**（見上方勘誤）。
+- 下一篇（Day 21）主題：`Storage Class` 與 `PersistentVolumeClaim`——不必再透過 `aws-cli` 等外部指令手動建立 Volume，而是能用 `kubectl` 搭配 YAML 設定檔動態產生所需的 Volumes，對管理多個 Volumes 更有幫助。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -1947,7 +2145,7 @@ $ minikube ip
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
 | Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
 | Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類） |
-| Utilize persistent and ephemeral volumes | Volume 的使用 | 尚未涉及 |
+| Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制，尚未涉及 `PersistentVolume`/`PersistentVolumeClaim`/`StorageClass`） |
 
 ## 20% - Application Deployment
 
@@ -1991,9 +2189,10 @@ $ minikube ip
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20，尚缺 PersistentVolume/PersistentVolumeClaim/StorageClass）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
 - **Day 19 補充說明**：`Ingress` 只是規則設定檔，真正負責轉發、負載平衡的是額外部署的 `Ingress Controller`，兩者是「宣告 vs. 執行」的分工——這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 是同樣的分工模式，考試時要留意兩者缺一不可。
+- **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；CKAD 考綱這裡真正的重點其實是**下一篇（Day 21）** 的 `PersistentVolume` / `PersistentVolumeClaim`（這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 PVC 動態要資源）。
 - 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
