@@ -14,6 +14,7 @@
 - [Day 13](#day-13) - Demo：在 minikube 上架設 Stateless Wordpress
 - [Day 17](#day-17) - DNS Service Discovery（kube-dns）
 - [Day 18](#day-18) - ConfigMap（配置與程式碼分離）
+- [Day 19](#day-19) - Ingress 與 Ingress Controller（負載平衡）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -38,6 +39,7 @@
 - **Demo（Wordpress）**：單一 Pod 內多 container 協作（wordpress + mysql）、`localhost` 溝通、Secret 同時被兩個 container 引用
 - **DNS / kube-dns**：`kube-dns` 讓 Pod 之間可透過 Service 名稱（而非動態 Cluster IP）互相溝通、`/etc/resolv.conf` 自動注入 nameserver
 - **ConfigMap**：`kubectl create configmap`（`--from-file` / `--from-literal`）、非機密的部署配置（與 Secret 的機密資料互補）、以 `volumes.configMap` 掛載成檔案供 container 使用
+- **Ingress / Ingress Controller**：統一對外 port、以路徑（path）或 domain name 導流到不同 Service、SSL termination、Ingress Controller（Nginx/GCE）才是真正實現負載平衡的元件
 
 
 # Day5
@@ -1503,6 +1505,119 @@ http://192.168.99.100:31529
 
 瀏覽器打開該網址後看到 `Hello World!` 字串，代表請求成功經 Nginx 反向代理到 Node.js App，也證明 ConfigMap 成功掛載在 Nginx Pod 上。
 
+## 補充：`demo-cm-nginx` 裡，一個 Pod、兩個 container、`kubectl expose` 的關係
+
+用專案裡實際的 [`demo-cm-nginx/my-pod.yaml`](demo-cm-nginx/my-pod.yaml) 跟 [`demo-cm-nginx/my-nginx.conf`](demo-cm-nginx/my-nginx.conf)，再搭配實際跑出來的指令結果，把「一個 Pod 兩個 container」跟「`kubectl expose`」兜起來看：
+
+```yaml
+# my-pod.yaml（節錄）
+metadata:
+  name: apiserver
+  labels:
+    app: webserver
+    tier: backend
+spec:
+  containers:
+  - name: nodejs-app          # 真正處理邏輯、回應 Hello World! 的後端
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+  - name: nginx                # 反向代理，掛載 ConfigMap 當設定檔
+    image: nginx:1.13
+    ports:
+    - containerPort: 80
+    volumeMounts:
+    - name: nginx-conf-volume
+      mountPath: /etc/nginx/conf.d
+  volumes:
+  - name: nginx-conf-volume
+    configMap:
+      name: nginx-conf
+```
+
+`my-nginx.conf` 掛進 `nginx` container 後，關鍵是這兩行：
+
+```
+listen 80;
+proxy_pass http://127.0.0.1:3000;
+```
+
+nginx 自己監聽 `80`，收到請求後轉手打給 `127.0.0.1:3000`——也就是**同一個 Pod 裡的 `nodejs-app` container**。這能成立是因為 [Day 6](#day-6) 提過的機制：**同一個 Pod 內的 container 共用網路，可以用 `localhost` 互相溝通**，nginx 才能用 `127.0.0.1` 打到隔壁的 nodejs-app，不需要另外建立 Service。
+
+### `kubectl expose pod` 自動幫你做了什麼
+
+```bash
+$ kubectl expose pod apiserver --port=80 --type=NodePort
+service/apiserver exposed
+
+$ minikube service apiserver --url
+http://192.168.49.2:30170
+```
+
+這行指令等於自動幫你建出一個 Service：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: apiserver
+spec:
+  type: NodePort
+  selector:
+    app: webserver       # ← 沒給 --selector，自動抓 apiserver Pod 自己的 labels
+    tier: backend
+  ports:
+  - port: 80              # ← 你指定的 --port
+    targetPort: 80         # ← 沒指定 --target-port，預設跟 port 相同
+    nodePort: 30170         # ← 沒指定，Kubernetes 隨機分配（30000~32767，見 Day 9）
+```
+
+三個容易忽略的細節：
+
+- **selector 是自動抓的**：`kubectl expose pod <name>` 沒給 `--selector` 時，會直接把該 Pod 自己的 labels（`app=webserver, tier=backend`）複製過去當 Service 的 selector。
+- **targetPort 沒填就等於 port**：這裡只給了 `--port=80`，沒給 `--target-port`，所以 `targetPort` 也是 `80`。
+- **Service 只認「Pod IP 的某個 port 是誰在聽」，不知道也不管是哪個 container**：Pod 裡兩個 container 共用同一個 Pod IP，`nginx` 監聽 `80`、`nodejs-app` 監聽 `3000`，像同一棟樓開了兩個門號不同的門。Service 的 `targetPort: 80` 天生只會敲中 `nginx` 那扇門，敲不到 `nodejs-app`——除非另外建一個 `targetPort: 3000` 的 Service。
+
+### 完整流量路徑圖
+
+```
+瀏覽器
+  │  打 http://192.168.49.2:30170
+  ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Node (minikube)                                                │
+│   nodePort: 30170  ◄── 隨機分配，因為指令沒指定 --node-port         │
+│        │                                                        │
+│        ▼                                                        │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │ Service: apiserver (NodePort)                            │    │
+│  │   port: 80        ◄── 來自 --port=80                       │    │
+│  │   selector: app=webserver, tier=backend                  │    │
+│  │              ◄── 自動抓 apiserver Pod 的 labels             │    │
+│  └────────────────────────────────────────────────────────┘    │
+│        │ targetPort: 80（沒指定，預設同 port）                     │
+│        ▼                                                        │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │ Pod: apiserver（單一 Pod IP，兩個 container 共用網路）           │    │
+│  │                                                            │    │
+│  │  ┌─────────────────────┐      ┌─────────────────────┐     │    │
+│  │  │ container: nginx     │      │ container: nodejs-app│     │    │
+│  │  │  監聽 port 80  ◄──────┼──────┤ 監聽 port 3000        │     │    │
+│  │  │  (Service targetPort  │ 打  │  (真正處理 request 的  │     │    │
+│  │  │   打進來的就是這扇門)   │127.0.0.1:3000│  後端)          │     │    │
+│  │  │                       │─────▶│                       │     │    │
+│  │  │  proxy_pass           │      │  回傳 "Hello World!"    │     │    │
+│  │  │  http://127.0.0.1:3000│      │                       │     │    │
+│  │  └─────────────────────┘      └─────────────────────┘     │    │
+│  │        ▲                                                    │    │
+│  │        │ 掛載 ConfigMap: nginx-conf → my-nginx.conf            │    │
+│  │        │ (mountPath: /etc/nginx/conf.d)                       │    │
+│  └────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**一句話總結**：Service 只負責把外部流量從 `NodePort(30170)` → `Service Port(80)` → 送到 **Pod IP 的 80 port**；至於 Pod 裡是誰在 80 port 上接（這裡是 `nginx`），跟 Service 完全無關。「兩個 container 怎麼合作」發生在 Service 完全不知情的**Pod 內部**——`nginx` 用 `localhost:3000` 把請求轉給隔壁的 `nodejs-app`，這一步跟 [Day 13](#day-13) wordpress + mysql、[Day 17](#day-17) 的 Port 拆解是同一套底層邏輯的不同應用。
+
 ## 我的想法
 
 - ConfigMap 跟 [Day 12](#day-12) Secret 掛載成檔案的機制幾乎是同一套（`volumes` + `volumeMounts` 名稱對應），差別純粹在**用途**：Secret 存機密、會 base64 編碼；ConfigMap 存非機密的部署配置、明碼存放。理解了其中一個，另一個幾乎是直接套用。
@@ -1513,6 +1628,301 @@ http://192.168.99.100:31529
 - ConfigMap 用來統一存放**非機密**的部署配置（跟 [Day 12](#day-12) Secret 存放機密資料互補），可透過 `--from-file` 匯入整個設定檔，或 `--from-literal` 直接指定單一 key/value。
 - 掛載方式與 Secret 相同，都是透過 `volumes` + `volumeMounts` 把內容掛成 container 內的檔案。
 - 下一篇（Day 20）主題：`Volumes`——如何讓 Pod 的資料持久化（呼應 [Day 13](#day-13) 尾聲提到「Stateless Wordpress 資料不持久化」的待補坑）。
+
+# Day 19
+
+> 參考來源：[[Day 19] 在 Kubernetes 中實現負載平衡 - Ingress Controller](https://ithelp.ithome.com.tw/articles/10196261)
+
+## 前言：為什麼需要 Ingress
+
+[Day 9](#day-9) 介紹過的 Service，能讓 Cluster 中的 Pod 被外部存取，但**每一個 Service 都要指定一個對外的 port，跟 Node 上某個 port 做 port mapping**。這代表 **Service 數量一多，需要管理的 port number 也跟著變多**，維運上更複雜；像 AWS、GCP 這類雲端服務，每台機器都有自己的防火牆，新增或刪除 Service 都得跟著調整防火牆規則。
+
+`Ingress` 的解法：**只開放一個對外的 port number**，在設定檔中依路徑（path）決定要把請求送到哪個 Service。
+
+今天筆記涵蓋：
+
+- 介紹什麼是 Ingress（含三個範例：依路徑導流、依 domain name 導流、SSL termination）
+- 進階實作：在 minikube 上架設 Nginx Ingress Controller
+
+> 範例程式碼可參考原文附的 [demo-ingress](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day19/demo-ingress)。
+
+## 什麼是 Ingress
+
+沒有 Ingress 時，多個 Service 同時運行，Node 必須為每個 Service 開一個對應的 port；用了 Ingress 後，**只需要開放一個對外的 port**，由 Ingress 依設定檔中的規則（路徑、domain name 等）決定流量該轉給哪個 Service。除了少維護多個 port、少改防火牆規則，「可自訂條件」的特性也讓導流更有彈性。
+
+> **勘誤（API 版本）**：原文（2018 年）寫的 Ingress API 版本是 `extensions/v1beta1`，這個版本在 **Kubernetes 1.22（2021 年）已被整個移除**（不是 deprecated，是真的拿掉），現在的叢集（例如本機 minikube，Server Version v1.35.1）只認 **`networking.k8s.io/v1`**，用舊版本會直接報錯：`no matches for kind "Ingress" in version "extensions/v1beta1"`。以下範例已全部改成 `networking.k8s.io/v1` 的新寫法，並存成本機的 [`demo-ingress/ingress-example-1.yaml`](demo-ingress/ingress-example-1.yaml) 驗證可用。新舊語法差異：
+>
+> | | 舊（`extensions/v1beta1`） | 新（`networking.k8s.io/v1`） |
+> | --- | --- | --- |
+> | 指定後端 Service | `backend.serviceName` / `backend.servicePort`（平的） | `backend.service.name` / `backend.service.port.number`（巢狀） |
+> | path 比對規則 | 沒有，隱含行為 | **必填** `pathType`（`Prefix` / `Exact` / `ImplementationSpecific`） |
+
+### Example 1：依路徑（path）導到不同 Service
+
+```yaml
+# ingress-example-1.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-1
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /test
+        pathType: Prefix
+        backend:
+          service:
+            name: test
+            port:
+              number: 80
+```
+
+- 目前 Ingress 使用的 API 版本是 `networking.k8s.io/v1`（原文寫的 `extensions/v1beta1` 已於 K8s 1.22 移除，見上方勘誤）。
+- 這份設定代表：Node 收到流量後判斷路徑，若請求路徑**前綴**是 `/test`（`pathType: Prefix`），就把流量導到名稱為 `test` 的 Service。
+
+```bash
+$ kubectl create -f ./ingress-example-1.yaml
+ingress "example-1" created
+```
+
+### Example 2：依 domain name 導到不同 Service
+
+```yaml
+# ingress-example-2.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-2
+spec:
+  rules:
+  - host: helloworld-v1.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hellworld-v1
+            port:
+              number: 80
+  - host: helloworld-v2.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: helloworld-v2
+            port:
+              number: 80
+```
+
+若有多個 Domain Name 同時指向同一台 Node，可以用這種寫法把不同 Domain Name 對應到不同 Service。跟 `example-1` 不同的是，`example-1` 只看路徑是否相符就導給 `test`，`example-2` 是**先判斷請求打的是哪個 Domain Name，再導到對應的 Service**。
+
+```bash
+$ kubectl create -f ./ingress-example-2.yaml
+ingress "example-2" created
+```
+
+### Example 3：SSL termination
+
+Ingress 也能做**本地終止 SSL（SSL termination）**。先把 SSL 憑證存進 Secret：
+
+```yaml
+# ingress-ssl-secret.yaml
+apiVersion: v1
+data:
+  tls.crt: base64_encoded_cert
+  tls.key: base64_encoded_key
+kind: Secret
+metadata:
+  name: ssh-secret
+  namespace: default
+type: Opaque
+```
+
+再透過 `spec.tls` 把憑證掛到 Ingress 底下：
+
+```yaml
+# ingress-example-3.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-3
+spec:
+  tls:
+  - secretName: ssh-secret
+  defaultBackend:            # v1 把原本的 spec.backend 改名為 spec.defaultBackend
+    service:
+      name: apiservice
+      port:
+        number: 80
+```
+
+## 在 minikube 上架設 Nginx Ingress Controller
+
+**Ingress 本身沒有提供負載平衡（Load Balancing）的功能，需要搭配 `Ingress Controller` 才能實現**。目前主要支援兩種：`GCE` 與 `Nginx`；今天示範用 **Nginx Ingress Controller** 在 Cluster 內部架設 load balancer。
+
+> 負載平衡（Load Balancing）：以往可以透過外部資源（如 AWS ELB）把流量分配給不同機器；Kubernetes 提供的 Ingress Controller，讓我們能在 Cluster 內部自己實現 Load Balancing，不需依賴外部資源。
+
+### 1. 建立 Hello World Application
+
+```yaml
+# helloworld-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: helloworld-pod
+  labels:
+    app: helloworld-pod
+    tier: backend
+spec:
+  containers:
+  - name: api-server
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+```
+
+```yaml
+# helloworld-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: helloworld-service
+spec:
+  ports:
+  - port: 3000
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: helloworld-pod
+```
+
+```bash
+$ kubectl create -f ./helloworld-pod.yaml
+pod "helloworld-pod" created
+
+$ kubectl create -f ./helloworld-service.yaml
+service "helloworld-service" created
+```
+
+### 2. 建置 Ingress Controller：直接用 minikube 內建 addon
+
+原文示範的做法，是照著 ingress-nginx 官方 `deploy` 資料夾的 README，手動 `kubectl apply` 好幾個分散的 yaml（namespace、default backend、ConfigMap、Controller 本身）：
+
+```bash
+# 原文（2018 年）的做法——namespace.yaml / default-backend.yaml / configmap.yaml /
+# tcp-services-configmap.yaml / udp-services-configmap.yaml / without-rbac.yaml
+$ curl https://raw.githubusercontent.com/kubernetes/ingress-nginx/master/deploy/namespace.yaml \
+  | kubectl apply -f -
+# ...（以下省略，原理同上）
+```
+
+> **勘誤（安裝方式已失效）**：上面這種「分成好幾個檔案，一個個 `curl | kubectl apply`」的方式現在**全部會失敗（curl 404）**。ingress-nginx 官方後來把所有元件整併成**單一一份安裝 YAML**，原文那些拆開的路徑（`namespace.yaml`、`default-backend.yaml`、`configmap.yaml`、`without-rbac.yaml`⋯）已經全數失效、不要再照著執行。
+>
+> 這份筆記的環境是 **minikube**，可以完全跳過上面手動 apply 的步驟，直接用內建 addon 一行指令搞定：
+>
+> ```bash
+> $ minikube addons enable ingress
+> ingress was successfully enabled
+> ```
+>
+> 執行後，minikube 就會自動幫你把**最新版的 Ingress Controller、ConfigMap、Service、RBAC 全部安裝好**，不用擔心裝到過期或失效的元件——這也是這份筆記後續操作實際採用的方式。若不是 minikube、而是正式雲端 Cluster（AWS/GCP/Azure），才需要去查 [ingress-nginx 官方最新的安裝文件](https://kubernetes.github.io/ingress-nginx/deploy/)，用現行版本的單一安裝 YAML。
+
+安裝完後，可以用以下指令確認：
+
+```bash
+$ kubectl get all -n ingress-nginx   # 確認 ingress-nginx namespace 底下的物件都 Ready
+```
+
+### 3. 建立 Helloworld Ingress
+
+```yaml
+# helloworld-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: helloworld-ingress
+  namespace: default
+spec:
+  rules:
+  - host: helloworld.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: helloworld-service
+            port:
+              number: 3000
+```
+
+把打向 `helloworld.example.com` 的請求都轉到 `helloworld-service`。
+
+### 4. 取得 minikube IP，設定本機端 hosts
+
+```bash
+$ minikube ip
+192.168.99.100
+```
+
+編輯本機的 `/etc/hosts`（macOS / Linux），把 `helloworld.example.com` 指向剛剛查到的 minikube IP，讓本機查詢這個網域時，會被導到 minikube 的 IP address。
+
+### 5. Demo
+
+瀏覽器打開 `http://helloworld.example.com/`，會看到回傳 `Hello World!`，代表 `helloworld-ingress` 成功把流量導到 `helloworld-pod`。若改打一個沒有設定的路徑／網域，Ingress Controller 會回傳先前建立的 `default-backend`（`default backend - 404`）。
+
+## 關係圖：Service 直接曝露 vs. Ingress 統一入口
+
+```
+【沒有 Ingress：每個 Service 各自佔用一個對外 port，Node 防火牆要開多個洞】
+外部使用者
+  │
+  ├──▶ <NodeIP>:30001 ──▶ Service A ──▶ Pod A
+  ├──▶ <NodeIP>:30002 ──▶ Service B ──▶ Pod B
+  └──▶ <NodeIP>:30003 ──▶ Service C ──▶ Pod C
+
+【有 Ingress：只開一個對外入口，由 Ingress 規則決定導去哪個 Service】
+外部使用者
+  │  打 http://helloworld.example.com/
+  ▼
+┌──────────────────────────────────────────┐
+│ Ingress Controller（Nginx，本身是一個 Pod/  │  ← 真正做負載平衡、轉發的元件
+│ Deployment，運行在 ingress-nginx namespace） │
+└──────────────────────────────────────────┘
+        │  依 Ingress 規則（host / path）比對
+        ▼
+┌──────────────────────────────────────────┐
+│ Ingress: helloworld-ingress                │  ← 只是規則設定檔，本身不轉發流量
+│   host: helloworld.example.com             │
+│   → serviceName: helloworld-service        │
+│   → servicePort: 3000                      │
+└──────────────────────────────────────────┘
+        │
+        ▼
+   Service: helloworld-service（port 3000 → targetPort 3000）
+        │
+        ▼
+   Pod: helloworld-pod（containerPort 3000）
+```
+
+## 我的想法
+
+- 這天解決的是 [Day 9](#day-9) NodePort 疊層關係圖裡最外層的痛點：NodePort 讓每個 Service 都要在 Node 上單獨佔一個實體 port（30000~32767 範圍內），Service 一多，port 管理跟防火牆規則就跟著爆炸。Ingress 把這個問題收斂成「只開一個入口，規則寫在 yaml 裡」，是**管理面**的優化，不是取代 Service——最終流量還是會落到 Service → Pod 這條路徑上（見上圖）。
+- 容易搞混的一點：**`Ingress` 物件本身只是規則設定檔，不會憑空產生負載平衡能力**，必須額外部署 `Ingress Controller`（Nginx / GCE）這個真正在跑的元件來讀取、執行這些規則。這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 的分工模式很像：一個是「宣告規則」，一個是「執行規則」。
+- Ingress 是這系列筆記裡第一個**因為 API 版本太舊而直接跑不動**的元件（`extensions/v1beta1` 已被移除，見上方勘誤）。這提醒了一件事：像 Deployment（`apps/v1beta2` → `apps/v1`）、Ingress 這種還在快速演進的資源，**yaml 裡的 `apiVersion` 有沒有過期，是實際動手前就該先用 `kubectl api-resources` 或 `kubectl explain <kind>` 確認的事**，不能照抄教學文章的版本號。
+- 不只是 yaml 內容會過期，**安裝步驟本身也會過期**：原文手動 `curl` 拆開的多個 ingress-nginx 部署檔案，路徑早就 404 了（官方已整併成單一安裝檔）。這種「第三方元件的官方安裝方式」比 K8s 核心資源的 `apiVersion` 變動更頻繁，遇到教學文章的安裝指令跑不動時，優先找**平台本身有沒有現成的 addon**（像 minikube 的 `addons enable`）通常比硬查官方最新安裝路徑更省事、也更不容易裝到過期版本。
+
+## 小結
+
+- Ingress 讓多個 Service 共用**一個對外 port**，並可依路徑或 domain name 決定導流目標，也支援 SSL termination。
+- Ingress 本身**不提供負載平衡**，需要搭配 `Ingress Controller`（本篇示範 Nginx）才能真正在 Cluster 內部實現 Load Balancing，取代外部資源（如 AWS ELB）。
+- Ingress Controller 目前仍有一些已知 issue，正式導入前建議先詳讀官方 README。
+- **API 版本勘誤**：本篇所有 Ingress yaml 已從原文的 `extensions/v1beta1` 更新為現行的 `networking.k8s.io/v1`（`backend.serviceName/servicePort` → `backend.service.name/port.number`，並新增必填的 `pathType`），可對照 [`demo-ingress/ingress-example-1.yaml`](demo-ingress/ingress-example-1.yaml) 驗證。
+- **安裝方式勘誤**：原文手動 `curl` 拆開的多個 ingress-nginx 部署 yaml（`namespace.yaml`/`default-backend.yaml`/`configmap.yaml`/`without-rbac.yaml`⋯）路徑已全數失效，官方已整併成單一安裝檔。這份筆記的環境（minikube）改用 `minikube addons enable ingress` 一行指令安裝，等同於裝好最新版的 Ingress Controller、ConfigMap、Service、RBAC。
 
 # CKAD TEST
 
@@ -1577,12 +1987,13 @@ http://192.168.99.100:31529
 | --- | --- | --- |
 | NetworkPolicies | 網路流量控管規則 | 尚未涉及 |
 | 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制）、[Day 17](#day-17)（`kube-dns`：Pod 之間透過 Service 名稱互相溝通，不受 Cluster IP 動態變動影響） |
-| Ingress | 對外路由規則 | 尚未涉及 |
+| Ingress | 對外路由規則 | [Day 19](#day-19)（Ingress 依路徑/domain name 導流、SSL termination、Ingress Controller 實現負載平衡） |
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）。
-- Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 與 `Ingress` 尚未涉及，其餘知識點已有不錯的覆蓋。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）。
+- Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
-- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe 等，是後續應優先加強的重點。
+- **Day 19 補充說明**：`Ingress` 只是規則設定檔，真正負責轉發、負載平衡的是額外部署的 `Ingress Controller`，兩者是「宣告 vs. 執行」的分工——這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 是同樣的分工模式，考試時要留意兩者缺一不可。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。

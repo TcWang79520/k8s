@@ -1,0 +1,10 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-3
+spec:
+  tls:
+  - secretName: ssh-secret
+  backend:
+    serviceName: apiservice
+    servicePort: 80

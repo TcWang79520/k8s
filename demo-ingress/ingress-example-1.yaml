@@ -1,0 +1,15 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-1
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /test
+        pathType: Prefix       # 👈 1. v1 必填欄位：指定路徑比對方式
+        backend:
+          service:             # 👈 2. 改為 service 層級
+            name: test         # 👈 3. 原本的 serviceName 移到這裡
+            port:
+              number: 80       # 👈 4. 原本的 servicePort 移到這裡

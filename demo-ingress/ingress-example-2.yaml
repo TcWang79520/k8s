@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-2
+spec:
+  rules:
+  - host: helloworld-v1.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix       # 👈 v1 必填欄位
+        backend:
+          secrvie:             # 👈 改為 service 階層
+            name: hellworld-v1 # (小提醒：注意原檔這裡是否少打一個 o)
+            port:
+              number: 80
+  - host: helloworld-v2.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix       # 👈 v1 必填欄位
+        backend:
+          service:
+            name: helloworld-v2
+            port:
+              number: 80
