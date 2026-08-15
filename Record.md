@@ -19,6 +19,7 @@
 - [Day 21](#day-21) - Storage Class 與 PersistentVolumeClaim（動態產生 Volumes）
 - [Day 22](#day-22) - Demo：在 minikube 上架設 Stateful Wordpress（PVC + initContainer）
 - [Day 25](#day-25) - Horizontal Pod Autoscaling（自動擴縮 Pod 數量）
+- [Day 27](#day-27) - Namespaces 與 ResourceQuota（團隊/專案資源隔離）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -48,6 +49,7 @@
 - **Storage Class / PersistentVolumeClaim**：`StorageClass`（定義 Volume 模板：provisioner / type / zone / `reclaimPolicy`）、`PersistentVolumeClaim`（依模板動態產生並綁定 Volume）、`accessModes`（`ReadWriteOnce` / `ReadOnlyMany` / `ReadWriteMany`）、Pod 以 `volumes.persistentVolumeClaim.claimName` 掛載
 - **Stateful Wordpress Demo**：MySQL／Wordpress 各自獨立 Deployment + PVC，靠 Service DNS 溝通；minikube 內建 `standard` StorageClass（`k8s.io/minikube-hostpath`）；`initContainer` 做正式 container 啟動前的一次性準備工作（修權限）
 - **Horizontal Pod Autoscaling**：`resources.requests.cpu`（資源請求）、`HorizontalPodAutoscaler`（`autoscaling/v2`：`scaleTargetRef`/`minReplicas`/`maxReplicas`/`metrics[].resource.target.averageUtilization`/`behavior.scaleDown.stabilizationWindowSeconds`）、metrics-server（已啟用並實測 scale up/down）、HPA 依 label selector 抓 metrics 導致衝突的踩坑經驗
+- **Namespaces / ResourceQuota**：`kubectl create namespace`、`kubectl config set-context --current --namespace=`（切換預設 namespace）、`ResourceQuota`（`requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` 運算資源、`services`/`secrets`/`configmaps`/`replicationcontrollers` 物件數量）、刪除 namespace 會級聯刪除底下所有物件、Kubernetes 自動產生的 `kube-root-ca.crt` ConfigMap 會計入 quota
 
 
 # Day5
@@ -920,7 +922,7 @@ Pod: my-pod-with-mounting-secret
 
 ## 小結
 
-- Secret 建立後，Cluster 內其他有權限的使用者／物件也能存取其中的敏感資料，因此需要搭配 **Service Account** 限制存取範圍（Day 28 `Namespaces` 會再介紹更完整的專案隔離方式）。
+- Secret 建立後，Cluster 內其他有權限的使用者／物件也能存取其中的敏感資料，因此需要搭配 **Service Account** 限制存取範圍（[Day 27](#day-27) `Namespaces` 會再介紹更完整的專案隔離方式）。
 - **勘誤**：base64 只是一種**編碼（encoding）**方式，不是**加密（encryption）**，不能單靠它保護敏感資料的安全性。
 - 下一篇（Day 13）主題：`Demo`——在 minikube 上架設 Stateless Wordpress。
 
@@ -2800,6 +2802,213 @@ $ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
 - **踩坑記錄**：HPA 一開始因為 label selector 跟很早期（Day 5/9）留下的獨立 Pod `helloworld-pod` 衝突（該 Pod 沒有 `resources.requests.cpu`）而持續失敗，刪除那個舊 Pod 後才恢復正常——提醒之後建立新 demo 物件時，label 也要跟舊物件做好區隔，不能只顧著物件名稱。
 - 這篇原文示範的 Heapster 已經完全從 Kubernetes 移除，是目前筆記遇到技術債最重的一篇；本篇已經改用 `metrics-server` + `autoscaling/v2` + `apps/v1` 全部驗證過一輪，專案裡的 [demo-hpa](demo-hpa) 資料夾（`helloworld-depolyment.yaml`／`helloworld-hpa.yaml`／`helloworld-hpa-service.yaml`）就是實際使用的版本。
 
+# Day 27
+
+> 參考來源：[[Day 27] Kubernetes 如何分配團隊資源？ - Namespaces](https://ithelp.ithome.com.tw/articles/10197186)
+
+## 前言
+
+前一天的學習筆記介紹了 [Resource Quotas](https://kubernetes.io/docs/concepts/policy/resource-quotas/)，避免單一 Pod 佔用整個 Cluster 的資源；今天介紹另一個常常搭配使用的元件：[Namespaces](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/)。
+
+今天筆記涵蓋：
+
+- 什麼是 Namespaces
+- 實作：建立、切換、刪除 Namespace
+- 實作：用 `ResourceQuota` 限制某個 Namespace 的運算與物件資源，並實際驗證超過配額會被拒絕
+
+> 範例程式碼參考原文的 [demo-namespaces](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day27/demo-namespaces)；本機實際使用的版本在專案的 [demo-namespace/hellospace.yaml](demo-namespace/hellospace.yaml)。以下所有指令與輸出都是**實際在目前的 minikube 上跑過一輪**的結果。
+
+## Namespaces 是什麼
+
+Kubernetes 提供了**抽象的 Cluster（virtual cluster）概念**：讓我們能依專案、團隊，或商業考量，把原本擁有實體資源的單一 Kubernetes Cluster，劃分成幾個不同的抽象 Cluster，也就是 `Namespaces`。
+
+用 `kubectl get namespaces` 查看目前這個 minikube 上有哪些 namespace：
+
+```bash
+$ kubectl get namespaces
+NAME                   STATUS   AGE
+default                Active   100d
+ingress-nginx          Active   2d1h
+kube-node-lease        Active   100d
+kube-public            Active   100d
+kube-system            Active   100d
+kubernetes-dashboard   Active   6d2h
+newspace               Active   7h39m
+wkfl                   Active   100d
+```
+
+- **default**：預設的 Namespace，過去這系列筆記建立的物件（Deployment、Service 等）若沒特別指定，都是放在這裡。
+- **kube-system**：Kubernetes 內部元件用的 namespace，可以用 `kubectl get all -n kube-system` 查看，例如 [Day 17](#day-17) 的 `kube-dns` 就存放在這裡。
+- **kube-public**：內容可被所有使用者讀取的特殊 namespace。
+- **kube-node-lease**：原文寫於 2018 年，當時只有前三個內建 namespace；`kube-node-lease` 是 Kubernetes 1.13 之後才新增的第四個內建 namespace，用來存放每個 Node 的 lease 物件，讓 Node 心跳檢查（heartbeat）更有效率，不用每次都更新整個 Node 物件。
+- 其餘的 `ingress-nginx`、`kubernetes-dashboard`、`newspace`、`wkfl` 都是這個專案先前練習留下的 namespace（`ingress-nginx` 是 [Day 19](#day-19) Ingress Controller 用的、`newspace` 是這次示範建立的），不是一台全新 minikube 會有的東西。
+
+### Namespaces 的幾個特點
+
+- 同一個 Cluster 中，每個 Namespace 的名稱都要**獨一無二**。
+- **當一個 Namespace 被刪除時，裡面所有物件也會一併被刪除**（下面會實際驗證這一點）。
+- 可以透過 `ResourceQuota` 限制一個 Namespace 能使用的資源。
+
+## 建立、切換、刪除 Namespace
+
+**1. 建立一個新的 namespace**
+
+```bash
+$ kubectl create namespace newspace
+namespace/newspace created
+
+$ kubectl get namespace newspace
+NAME       STATUS   AGE
+newspace   Active   7h39m
+```
+
+**2. 切換預設 Namespace**
+
+先看目前 context 預設用哪個 namespace：
+
+```bash
+$ kubectl config view --minify | grep namespace:
+    namespace: default
+```
+
+原文用的是 `kubectl config set-context $(kubectl config current-context) --namespace=newspace`，需要先用指令替換出目前 context 的名稱；比較新版的 `kubectl` 支援用 `--current` 直接指目前這個 context，不用再自己組指令：
+
+```bash
+$ kubectl config set-context --current --namespace=newspace
+Context "minikube" modified.
+
+$ kubectl config view --minify | grep namespace:
+    namespace: newspace
+```
+
+切換後，之後沒有加 `-n`/`--namespace` 的 `kubectl` 指令，預設都會作用在 `newspace` 底下。
+
+**3. 刪除 Namespace**
+
+```bash
+$ kubectl delete namespace newspace
+namespace "newspace" deleted
+```
+
+> **這一步沒有實際在目前環境測試**：`default` 與 `kube-system` 這兩個 namespace 是無法被刪除的（`kubectl delete namespace default` 會被拒絕），這是 Kubernetes 內建的保護機制。因為目前這台 minikube 的 `default` namespace 裡還放著這系列筆記前面很多天的示範物件，若真的去嘗試刪除、卻不如預期被擋下，等於拿正在用的環境冒險，所以這裡選擇只記錄這個行為、不實際下手測試。
+
+## 實作：用 ResourceQuota 限制某個 Namespace 的資源
+
+以專案裡的 [demo-namespace/hellospace.yaml](demo-namespace/hellospace.yaml) 為例：
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hellospace
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: compute-quotas
+  namespace: hellospace
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    limits.cpu: "1"
+    limits.memory: 10Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: object-quotas
+  namespace: hellospace
+spec:
+  hard:
+    services: "2"
+    services.loadbalancers: "1"
+    secrets: "1"
+    configmaps: "1"
+    replicationcontrollers: "10"
+```
+
+這份設定檔建立了一個 `hellospace` namespace，並用兩個 `ResourceQuota` 限制它：
+
+- **運算資源（compute-quotas）**：CPU 最多請求 `1` core、上限 `1` core；記憶體請求最多 `1Gi`、上限 `10Gi`。
+- **物件資源（object-quotas）**：最多 `2` 個 `services`（其中最多 `1` 個是 `loadbalancer` 類型）、最多 `1` 個 `secret`、`1` 個 `configmap`、`10` 個 `replicationcontroller`。
+
+> 原文附的 yaml 裡，`compute-quotas.spec.hard` 底下其實**重複寫了兩次 `requests.memory`**（一次 `1Gi`、一次 `10Gi`，且完全沒有 `limits.memory` 這個 key）；YAML 對同一個 map 裡重複的 key 只會保留其中一個，等於原文的範例根本沒有限制到 `limits.memory`，跟文字描述的「memory 使用被限制在 10Gi 以下」對不上。這裡列出的版本已經把第二個 `requests.memory: 10Gi` 改成 `limits.memory: 10Gi`，是真正對應到文字說明、且跟 `requests.cpu`/`limits.cpu` 對稱寫法的正確版本。
+
+```bash
+$ kubectl create -f demo-namespace/hellospace.yaml
+namespace/hellospace created
+resourcequota/compute-quotas created
+resourcequota/object-quotas created
+
+$ kubectl get resourcequotas -n hellospace
+NAME             REQUEST                                                     LIMIT
+compute-quotas   requests.cpu: 0/1, requests.memory: 0/1Gi                   limits.cpu: 0/1, limits.memory: 0/10Gi
+object-quotas    configmaps: 1/1, replicationcontrollers: 0/10, secrets: 0/1, services: 0/2, services.loadbalancers: 0/1
+```
+
+有趣的是，`hellospace` **剛建立好、什麼都還沒手動部署，`object-quotas` 的 `configmaps` 就已經是 `1/1`（滿的）**：
+
+```bash
+$ kubectl get configmap -n hellospace
+NAME               DATA   AGE
+kube-root-ca.crt   1      31s
+```
+
+`kube-root-ca.crt` 是 Kubernetes 自動在**每個新建立的 namespace**裡放的 ConfigMap（存放叢集的 CA 憑證，供該 namespace 底下的 Pod 驗證 API Server 用），不需要手動建立。這代表：只要 `configmaps` quota 設成 `"1"`，這個 namespace 實際上**一個使用者自建的 configmap 都放不下**——直接驗證看看：
+
+```bash
+$ kubectl create configmap my-config --from-literal=foo=bar -n hellospace
+error: failed to create configmap: configmaps "my-config" is forbidden: exceeded quota: object-quotas, requested: configmaps=1, used: configmaps=1, limited: configmaps=1
+```
+
+`secrets` quota 則沒有被自動佔用，可以先成功建一個，第二個才會被擋下來：
+
+```bash
+$ kubectl create secret generic demo-secret --from-literal=key=value -n hellospace
+secret/demo-secret created
+
+$ kubectl create secret generic demo-secret-2 --from-literal=key=value -n hellospace
+error: failed to create secret secrets "demo-secret-2" is forbidden: exceeded quota: object-quotas, requested: secrets=1, used: secrets=1, limited: secrets=1
+```
+
+最後刪除整個 `hellospace` namespace，驗證前面提到的「刪除 Namespace 會連帶刪除底下所有物件」：
+
+```bash
+$ kubectl delete namespace hellospace
+namespace "hellospace" deleted
+
+$ kubectl get namespace hellospace
+Error from server (NotFound): namespaces "hellospace" not found
+
+$ kubectl get resourcequota -n hellospace
+No resources found in hellospace namespace.
+```
+
+`hellospace` 底下的 `ResourceQuota`、`Secret`、自動產生的 `ConfigMap` 全部隨著 namespace 一起消失，不需要一個一個手動清。
+
+## 勘誤
+
+1. **`kube-node-lease` 是原文沒有的第四個內建 namespace**：原文（2018 年）只提到 `default`/`kube-system`/`kube-public` 三個，`kube-node-lease` 是 Kubernetes 1.13 才新增的。
+2. **原文 yaml 有 `requests.memory` 重複 key 的 bug**：見上方「實作」段落的說明，正確寫法應該是 `limits.memory: 10Gi`，不是又寫一次 `requests.memory: 10Gi`。
+3. **原文示範「hellospace 已經有一個 secret 物件」在現在的 Kubernetes 上不成立**：2018 年當時，每個 ServiceAccount 預設會自動產生一個對應的 **Secret**（存放長期有效的 token），所以原文一建立完 namespace，`secrets` quota 就已經被佔用 1 個。但這個自動產生 Secret 的機制已經在 **Kubernetes 1.24 起被移除**，改用 [TokenRequest API](https://kubernetes.io/docs/reference/access-authn-authz/service-account-issuer-discovery/) 動態核發、有效期限較短的 token，不再是一個常駐的 Secret 物件——這也是為什麼上面實測 `kubectl get secrets -n hellospace` 是空的。**取而代之的是，現在每個新 namespace 會自動產生一個 `kube-root-ca.crt` ConfigMap**，所以「一建立 namespace，quota 就已經被占用」這個現象還在，只是從 `secrets` 換成了 `configmaps`——這點兩個版本的 Kubernetes 行為不同，但背後的教訓（設定 `object-quotas` 時，要考慮 Kubernetes 自動產生的物件也會計入配額）完全一樣。
+4. **切換 context 的 namespace，`--current` 比原文的寫法更簡潔**：原文用 `kubectl config set-context $(kubectl config current-context) --namespace=newspace`，需要先用指令替換出目前 context 名稱；較新版的 `kubectl` 提供 `--current` 這個旗標可以直接代表目前的 context，不用再自己組指令，這也是本篇筆記採用的寫法。
+
+## 我的想法
+
+- `ResourceQuota` 的「自動產生的物件也算配額」這個坑，是這次實測意外發現最有價值的部分：原文示範的重點是「secrets quota 被系統自動產生的物件佔滿」，但現在的 Kubernetes 已經不會自動產生 Secret 了；不過概念完全沒消失，只是換了一個物件類型（`kube-root-ca.crt` ConfigMap）繼續存在。這提醒了一件事：**設計 `ResourceQuota` 時，不能只算「我自己會建立幾個物件」，還要算進 Kubernetes 自動幫每個 namespace 產生的東西**，尤其是 `configmaps`、`serviceaccounts` 這類配額，很容易一設就直接把自己的額度用光。
+- Namespace 搭配 `ResourceQuota`，某個角度上是 [Day 25](#day-25) HPA、[Day 7](#day-7) Replication Controller「限制/自動調整**單一** Deployment 資源」的上一層放大版——HPA 管的是一個 Deployment 能有幾個 Pod，`ResourceQuota` 管的是一整個 Namespace（可能有很多個 Deployment）能用多少資源，兩者是不同層級的資源管控，可以疊加使用。
+- 「刪除 Namespace 會連帶刪除底下所有物件」這個特性，這次直接實測驗證過（`hellospace` 刪除後，裡面的 `ResourceQuota`／`Secret`／自動產生的 `ConfigMap` 全部一起消失）；這也是為什麼原文特別強調 `default` 與 `kube-system` 這兩個 namespace 被保護、無法刪除的原因——不然不小心刪掉 `default`，會把 Cluster 裡沒特別指定 namespace 的物件全部一次清空。
+- [Day 12](#day-12) 小結那時候寫下「Secret 建立後，Cluster 內其他有權限的使用者／物件也能存取其中的敏感資料，需要搭配 Service Account 限制存取範圍」，並預告會在後面某天介紹 `Namespaces` 這種更完整的專案隔離方式——就是今天這篇；不過目前這篇還沒實際碰到 Service Account 怎麼跟 Namespace／RBAC 搭配限制存取，這塊留待之後有機會再補。
+
+## 小結
+
+- `Namespaces` 讓一個實體 Kubernetes Cluster 可以劃分成多個邏輯上獨立的虛擬 Cluster；同名限制在同一 namespace 內唯一、刪除 namespace 會連帶刪除裡面所有物件、`default`/`kube-system` 無法被刪除。
+- 切換預設 namespace：`kubectl config set-context --current --namespace=<name>`（比原文需要 `$(kubectl config current-context)` 組指令的寫法更簡潔）。
+- `ResourceQuota` 可以限制一個 Namespace 的運算資源（`requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory`）與物件數量（`services`/`secrets`/`configmaps`/`replicationcontrollers` 等），超過配額時 API Server 會直接拒絕該次 `create`，回傳 `exceeded quota` 錯誤。
+- **已在目前的 minikube 上實際部署並驗證**：`hellospace` 建立當下 `configmaps` quota 就被系統自動產生的 `kube-root-ca.crt` 占滿（現在的 Kubernetes 不再自動產生 Secret，原文示範的「已有一個 secret」現象改發生在 configmap 上）；`secrets` quota 則正常示範了「第一個成功、第二個被拒絕」；最後刪除 `hellospace` 也驗證了 namespace 級聯刪除的特性。
+- 專案裡的 [demo-namespace/hellospace.yaml](demo-namespace/hellospace.yaml) 已經修正了原文 yaml 重複 `requests.memory` key 的 bug，換成正確的 `limits.memory: 10Gi`。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -2850,7 +3059,7 @@ $ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
 | --- | --- | --- |
 | CRD / Operators | 擴充 Kubernetes 資源 | 尚未涉及 |
 | Authentication / Authorization / Admission Control | 認證授權機制 | 尚未涉及 |
-| Requests / limits / quotas | 資源請求與限制 | [Day 25](#day-25)（`requests` 部分，尚未涉及 `limits`／`ResourceQuota`） |
+| Requests / limits / quotas | 資源請求與限制 | [Day 25](#day-25)（container 層級 `requests`）、[Day 27](#day-27)（namespace 層級 `ResourceQuota`：`requests`/`limits`/物件數量配額，已實測驗證超額會被拒絕） |
 | 定義資源需求（resource requirements） | container resource requirements | [Day 25](#day-25)（`spec.resources.requests.cpu`，尚未涉及 `limits`） |
 | ConfigMaps | 設定值管理 | [Day 18](#day-18)（`kubectl create configmap`、`--from-file`/`--from-literal`、`volumes.configMap` 掛載成檔案） |
 | Secrets | 機敏資料管理 | [Day 12](#day-12)（`kubectl create secret`、YAML+base64、環境變數／volume 掛載，尚未涉及搭配 Service Account 限制存取） |
@@ -2867,7 +3076,7 @@ $ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
@@ -2876,4 +3085,5 @@ $ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
 - **Day 21 補充說明**：`StorageClass` + `PersistentVolumeClaim` 把 [Day 20](#day-20) 手動建立/記錄/回收 Volume 的流程自動化，`accessModes`（`ReadWriteOnce`/`ReadOnlyMany`/`ReadWriteMany`）與 `reclaimPolicy`（`Delete`/`Retain`）是這裡的核心考點；要留意不同 Volume Plugin 支援的 `accessModes` 不同（例如 AWS EBS 只支援 `ReadWriteOnce`），考試時容易忽略這個限制。
 - **Day 22 補充說明**：第一次把 `PersistentVolumeClaim`（Day 21）跟 `initContainer`（`Multi-container Pod design patterns` 這個考點）實際串起來部署驗證——PVC 不是只停留在 YAML 語法層面，而是實際刪除 Pod 重建、確認資料還在；`initContainer` 則示範了「正式 container 啟動前的一次性準備工作」這種常見 pattern，跟 `livenessProbe`（Day 11，服務啟動後持續檢查）是不同時間點的兩種機制，兩者都屬於 `Application Observability and Maintenance` 與 `Application Design and Build` 這兩個 Domain 常考的實作細節。
 - **Day 25 補充說明**：`resources.requests.cpu` 是 Environment/Config/Security Domain `定義資源需求`／`Requests/limits/quotas` 這兩個知識點第一次出現在筆記裡，但只涵蓋 `requests`，`limits` 與 `ResourceQuota` 仍待補；`HorizontalPodAutoscaler` 本身則沒有明確出現在目前 CKAD 官方考綱的 5 大 Domain 條目中（比較偏 CKA／進階維運範疇，跟 [Day 10](#day-10) 的 `nodeSelector` 狀況類似），準備考試可以降低這部分的優先度，但底層的 `resources.requests` 仍是實打實的考點。
-- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）三塊，其餘 CRD/Operators、Authentication/Authorization、`limits`／`ResourceQuota`、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
+- **Day 27 補充說明**：`ResourceQuota` 補上了 [Day 25](#day-25) 留下的 `limits`／配額缺口，把資源管控的層級從「單一 container」拉高到「整個 Namespace」；這次實測也發現一個容易忽略的細節——Kubernetes 會自動在每個 namespace 產生 `kube-root-ca.crt` 這個 ConfigMap，設定 `configmaps` 這類物件配額時要把這些自動產生的物件也算進去，不然配額可能一建立就被用光。`Namespaces` 本身雖然不是獨立的 CKAD 考綱條目，但幾乎是 `Requests/limits/quotas`、`ServiceAccounts`、`NetworkPolicies`（依 namespace 隔離網路流量）這幾個考點共同的基礎概念。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）四塊，其餘 CRD/Operators、Authentication/Authorization、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
