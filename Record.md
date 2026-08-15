@@ -18,6 +18,7 @@
 - [Day 20](#day-20) - Volumes（資料持久化：emptyDir / hostPath / Cloud Storage / NFS）
 - [Day 21](#day-21) - Storage Class 與 PersistentVolumeClaim（動態產生 Volumes）
 - [Day 22](#day-22) - Demo：在 minikube 上架設 Stateful Wordpress（PVC + initContainer）
+- [Day 25](#day-25) - Horizontal Pod Autoscaling（自動擴縮 Pod 數量）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -46,6 +47,7 @@
 - **Volumes**：讓 container 資料持久化（stateless → stateful）、四種常用類型 `emptyDir`（隨 Pod 生滅）/ `hostPath`（隨 Node 生滅）/ Cloud Storage（AWS EBS 等）/ `NFS`、`volumes` + `volumeMounts` 掛載機制
 - **Storage Class / PersistentVolumeClaim**：`StorageClass`（定義 Volume 模板：provisioner / type / zone / `reclaimPolicy`）、`PersistentVolumeClaim`（依模板動態產生並綁定 Volume）、`accessModes`（`ReadWriteOnce` / `ReadOnlyMany` / `ReadWriteMany`）、Pod 以 `volumes.persistentVolumeClaim.claimName` 掛載
 - **Stateful Wordpress Demo**：MySQL／Wordpress 各自獨立 Deployment + PVC，靠 Service DNS 溝通；minikube 內建 `standard` StorageClass（`k8s.io/minikube-hostpath`）；`initContainer` 做正式 container 啟動前的一次性準備工作（修權限）
+- **Horizontal Pod Autoscaling**：`resources.requests.cpu`（資源請求）、`HorizontalPodAutoscaler`（`autoscaling/v2`：`scaleTargetRef`/`minReplicas`/`maxReplicas`/`metrics[].resource.target.averageUtilization`/`behavior.scaleDown.stabilizationWindowSeconds`）、metrics-server（已啟用並實測 scale up/down）、HPA 依 label selector 抓 metrics 導致衝突的踩坑經驗
 
 
 # Day5
@@ -2615,6 +2617,189 @@ drwxrwxrwx 2 root root 4096 Aug 15 05:00 .
 - 實際刪除 Pod 驗證：`wordpress-stateful` 與 `mysql-stateful` 的 Pod 被刪除重建後，`wp-content/uploads` 與 `/var/lib/mysql` 底下的資料都還在，證實了 PVC 掛載的資料確實獨立於 Pod 生命週期之外——`Stateless Wordpress`（Day 13）到 `Stateful Wordpress`（Day 22）的升級到此完成。
 - 因為全程用新命名（`-stateful` 字尾）建立物件，[Day 13](#day-13) 的 `wordpress-app`/`wordpress-service` 與 [demo-wordpress-diff-pods](demo-wordpress-diff-pods) 的 `mysql-server`/`mysql-server-service` 完全沒被動到，之前幾天的示範仍然可以正常運作、對照閱讀。
 
+# Day 25
+
+> 參考來源：[[Day 25] Kubernetes 如何實現 Auto Scaling - Horizontal Pod Autoscaling](https://ithelp.ithome.com.tw/articles/10197046)
+
+## 前言
+
+前一天（Day 24）的學習筆記介紹了如何[監控 Kubernetes 上的資源使用狀況](https://ithelp.ithome.com.tw/articles/10196938)，今天接著介紹如何在 Kubernetes 上實現 [Autoscaling](https://en.wikipedia.org/wiki/Autoscaling)：應用服務的流量常常會變動，理想情況下希望系統能**根據目前的資源使用率，自動決定是否要增減資源**來因應流量，而不是一開始就固定配置好一組「應付尖峰流量」的資源、平常又浪費。AWS、GCP 等雲端服務商都有提供類似機制，Kubernetes 本身也提供了對應的 API：[Horizontal Pod Autoscaling（HPA）](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)。
+
+原文寫於 2018 年，示範用的 Heapster 元件現在已經整個從 Kubernetes 移除，直接照抄會完全跑不起來；這篇筆記已經**在目前的 minikube 上改用現代寫法（`metrics-server` + `autoscaling/v2`）實際裝好、部署並驗證過一輪完整的 HPA 流程**（Pod 數量隨負載自動從 2 個放大到 5 個，負載停止後又自動縮回 2 個），過程中還意外踩到一個 label selector 的坑，一併記錄在下面。
+
+今天筆記涵蓋：
+
+- 什麼是 Horizontal Pod Autoscaling
+- 實作：在 minikube 上部署 HPA（`metrics-server` + `autoscaling/v2`），並實際驗證 scale up / scale down
+- 踩坑記錄：HPA 抓 metrics 時因為 label selector 衝突而失敗
+
+> 範例程式碼參考原文的 [demo-hpa](https://github.com/zxcvbnius/k8s-30-day-sharing/blob/master/Day25/demo-hpa)；本機實際使用的版本在專案的 [demo-hpa](demo-hpa) 資料夾（`helloworld-depolyment.yaml`／`helloworld-hpa.yaml`／`helloworld-hpa-service.yaml`）。
+
+## 什麼是 Horizontal Pod Autoscaling
+
+`HorizontalPodAutoscaler`（HPA）可以根據 Pod 目前的資源使用量，動態決定是否要新增或減少 Pod 的數量。要讓 HPA 運作，Deployment 得先在 container 上宣告要請求（request）多少資源，HPA 才有一個「基準值」可以拿來算使用率百分比。
+
+### 1. Deployment 要先宣告 `resources.requests`
+
+```yaml
+# demo-hpa/helloworld-depolyment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helloworld-deployment-hpa
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: helloworld-pod
+  template:
+    metadata:
+      labels:
+        app: helloworld-pod
+    spec:
+      containers:
+      - name: my-pod
+        image: zxcvbnius/docker-demo:latest
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: 50m
+```
+
+跟前面幾天的 Deployment 比起來，`spec.template.spec.containers` 底下多了 `resources` 欄位：
+
+- **spec.resources.requests.cpu**：宣告該 container 運行時，Kubernetes 要**先保留**多少 CPU 資源給它。`50m` 等於 `50 milicpu`（millicore），代表要求（單核心）CPU `5%` 的資源；如果 Node 是多核心，`50m` 代表要求「每一核心」的 5%。數值刻意設得很低，是為了等一下壓測時很容易就把使用率衝過門檻，方便觀察 scale up。
+- **metadata.name** 用 `helloworld-deployment-hpa`（不是原文的 `helloworld-deployment`），是延續 [Day 22](#day-22) 開始的做法——新命名跟 cluster 裡舊物件區隔開來，不要互相覆蓋。
+
+### 2. 設定 HorizontalPodAutoscaler
+
+```yaml
+# demo-hpa/helloworld-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: helloworld-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: helloworld-deployment-hpa
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 30
+```
+
+- **spec.scaleTargetRef**：指定 autoscaling 的目標物件（這裡是 `helloworld-deployment-hpa` 這個 Deployment）。
+- **spec.minReplicas` / `spec.maxReplicas**：Pod 數量的下限與上限，這裡是最少 2 個、最多 5 個。
+- **spec.metrics**：`autoscaling/v2` 把監控條件改成陣列形式，可以同時放多種 metric（CPU、記憶體、自訂 metric）。這裡只放一種：`type: Resource` 的 `cpu`，`target.type: Utilization` 搭配 `averageUtilization: 50` 代表目標平均使用率 `50%`。以 `helloworld-deployment-hpa` 為例，`resources.requests.cpu` 宣告的是 `50m`，`averageUtilization: 50` 代表**當 CPU 使用率達到 `50m` 的 50%，也就是 `25m` 時，HPA 就會開始新增 Pod**。
+- **spec.behavior.scaleDown.stabilizationWindowSeconds: 30**：自訂縮容的穩定窗口為 `30` 秒——負載降下來後，HPA 會持續觀察 `30` 秒內的建議值取最大者，過了這個窗口才真的縮減 Pod 數量，避免使用率短暫波動就一直增減 Pod。這裡刻意設得比預設的 `300` 秒（5 分鐘）短很多，是為了 demo 時能快點看到 scale down 的效果；`scaleUp` 沒有另外設定，直接沿用預設行為（幾乎沒有延遲，偵測到就立刻放大，這也是下面觀察到的 Pod 數量會很快從 2 個衝到 5 個的原因）。
+
+## 踩坑記錄：HPA 一直抓不到 metrics，原因是 label selector 衝突
+
+部署好上面兩個物件後，`kubectl get hpa` 一開始並沒有像預期一樣顯示出 CPU 使用率，而是持續失敗。用 `kubectl describe hpa helloworld-hpa` 查看 Events，看到這樣的錯誤：
+
+```
+Warning  FailedGetResourceMetric  ...  failed to get cpu utilization: missing request for cpu in container api-server of Pod helloworld-pod
+Warning  FailedComputeMetricsReplicas  ...  invalid metrics (1 invalid out of 1), first error is: failed to get cpu resource metric value: ...
+```
+
+錯誤訊息提到的 `container api-server of Pod helloworld-pod`，並不是這次新建立的任何一個 Pod——追查後發現，是**很早期（[Day 5](#day5)/[Day 9](#day-9) 練習用）留下的一個獨立 Pod `helloworld-pod`**（container 名稱叫 `api-server`，當時沒有設定 `resources.requests.cpu`），跟這次新 Deployment 的 Pod 剛好共用了同一個 label `app: helloworld-pod`。
+
+**關鍵在於：HPA 抓 CPU 使用率時是照 `scaleTargetRef` 指向的 Deployment 的 `spec.selector`（label selector）去查詢 metrics，而不是只看「這個 Deployment 實際建立、擁有的 Pod」**。只要有其他 Pod 剛好帶著同一個 label，就會被一起算進去；而 HPA 要求「被選中的 Pod 全部都要有 `resources.requests.cpu`」，只要有一個沒有設定（像那個舊的 `helloworld-pod`），整個 metrics 計算就會失敗，`TARGETS` 會卡在 `<unknown>`，`ScalingActive` 條件也會是 `False`。
+
+把那個早期的獨立 Pod `helloworld-pod` 刪除之後，`ScalingActive` 才轉為 `True`，HPA 正式開始正常運作。這也是專案裡 `demo-hpa/helloworld-hpa-service.yaml` 那行「👈 正確且唯一的 selector」註解的由來：
+
+```yaml
+# demo-hpa/helloworld-hpa-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: helloworld-hpa-service
+spec:
+  type: ClusterIP
+  selector:
+    app: helloworld-pod        # 👈 正確且唯一的 selector
+  ports:
+  - port: 3000
+    protocol: TCP
+    targetPort: 3000
+```
+
+> 這個 Service 是特地為這次 demo 另外建的（跟舊的 `helloworld-service` 分開），目的是待會壓測時單純只打這個 Service，不去動到舊物件；不過因為衝突源頭（舊的 `helloworld-pod`）已經被刪除，目前 `helloworld-service` 跟 `helloworld-hpa-service` 的 selector 其實都指到同一組 `helloworld-deployment-hpa` 的 Pod。
+
+## 實作：部署並驗證 HPA 的完整生命週期
+
+```bash
+# 1. 建立 Deployment
+$ kubectl create -f demo-hpa/helloworld-depolyment.yaml
+
+# 2. 建立專屬的 Service
+$ kubectl create -f demo-hpa/helloworld-hpa-service.yaml
+
+# 3. 建立 HorizontalPodAutoscaler
+$ kubectl create -f demo-hpa/helloworld-hpa.yaml
+
+# 4. 確認 metrics-server 有正常運作（回應真實數字，不是 error）
+$ minikube addons enable metrics-server
+$ kubectl top nodes
+NAME       CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+minikube   256m         5%       2204Mi          22%
+
+# 5. 穩態下查看 HPA（沒有負載時）
+$ kubectl get hpa helloworld-hpa
+NAME             REFERENCE                              TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+helloworld-hpa   Deployment/helloworld-deployment-hpa   cpu: 0%/50%   2         5         2          ...
+
+# 6. 開一個臨時 Pod，對 helloworld-hpa-service 灌流量
+$ kubectl run -i --tty alpine --image=alpine --restart=Never -- sh
+/ # apk add curl
+/ # while true; do curl http://helloworld-hpa-service:3000; done
+```
+
+負載持續一段時間後，用 `kubectl describe hpa helloworld-hpa` 觀察到的實際過程：
+
+- **Conditions**：`AbleToScale=True`、`ScalingActive=True`（`ValidMetricFound`：已經能成功從 CPU 使用率算出建議的 replica 數）。
+- **Events（負載上升期間）**：CPU 使用率超過 `50%` 門檻後，連續發生兩次 `SuccessfulRescale`（reason 皆為 `cpu resource utilization (percentage of request) above target`）：Pod 數量 `2 → 4 → 5`，一路衝到 `maxReplicas` 上限。
+- **停掉 curl 迴圈後**：等了一小段時間（受 `scaleDown.stabilizationWindowSeconds: 30` 影響），又發生一次 `SuccessfulRescale`（reason 為 `All metrics below target`）：Pod 數量 `5 → 2`，退回 `minReplicas` 下限。
+- 縮容之後，`kubectl get hpa` 的 `Conditions` 多了 `ScalingLimited=True`（`TooFewReplicas`），代表目前已經卡在 `minReplicas` 這個下限，不會再往下縮。
+
+整個過程完整驗證了 HPA 的生命週期：CPU 使用率上升 → 觸發 scale up（幾乎立即，因為 `scaleUp` 沒設 stabilization window）→ 使用率下降 → 等 `scaleDown` 的冷卻時間（這裡設定的 30 秒）→ scale down 回到 `minReplicas`。
+
+## 勘誤：原文寫法 vs. 現在實際採用的做法
+
+> 這篇原文寫於 2018 年，是這系列筆記目前遇到**技術債最重的一篇**——示範用的核心元件已經整個從 Kubernetes 移除。以下是原文寫法，跟這次筆記實際採用、且已驗證可行的現代寫法對照：
+
+1. **Heapster → metrics-server**：原文示範裝 [heapster](https://github.com/kubernetes/heapster) 讓 HPA 讀取 metrics，但 Heapster 專案已封存，從 **Kubernetes 1.13 起被官方正式移除**，現在完全無法使用。這次改用 [metrics-server](https://github.com/kubernetes-sigs/metrics-server)（`minikube addons enable metrics-server` 一鍵啟用），`kubectl top` 與 HPA 都改吃它提供的 Metrics API。
+2. **`apiVersion: apps/v1beta2` → `apps/v1`**：跟前面幾天遇到的狀況一樣（[Day 13](#day-13)、[Day 20](#day-20) 等），`apps/v1beta2` 自 Kubernetes 1.16 起已被移除，這次 Deployment 直接採用 `apps/v1`。
+3. **`--horizontal-pod-autoscaler-downscale-delay`／`--horizontal-pod-autoscaler-upscale-delay` → `spec.behavior`**：這兩個 kube-controller-manager 的舊版旗標從 Kubernetes 1.13 起已被移除。這次直接在 HPA 物件的 `spec.behavior.scaleDown.stabilizationWindowSeconds` 設定 `30` 秒（比預設的 `300` 秒短很多，方便 demo 快點看到縮容），粒度比舊版的 Cluster 層級啟動參數更細，可以每個 HPA 各自設定冷卻時間。
+4. **`autoscaling/v1` → `autoscaling/v2`**：`v1` 版的 `targetCPUUtilizationPercentage` 只能設定單一 CPU 使用率門檻；這次改用 `autoscaling/v2`（已 GA），欄位換成陣列形式的 `spec.metrics[].resource.target.averageUtilization`，未來要加記憶體或自訂 metric 也是同一套寫法擴充即可。
+
+## 我的想法
+
+- HPA 把 [Day 7](#day-7) `kubectl scale` 那種「人工看流量、手動調整 Pod 數量」的動作自動化了——Day 7 的 `kubectl scale` 是「知道要幾個 Pod、手動下指令」，HPA 則是「設定門檻，讓 Kubernetes 自己決定要幾個 Pod」，兩者背後都是靠 Replica Set／Deployment 的 `replicas` 欄位在做事，只是誰來改這個數字的差別。
+- **HPA 是用 label selector（而不是 Deployment 的實際擁有關係）抓 metrics**，是這次踩坑學到最實用的一課：跟 [Day 10](#day-10) 提過的「Labels/Selector 是貫穿多個考點的底層機制」呼應——這次連 HPA 這種看起來「只認 Deployment」的物件，底層一樣是靠 label selector 在運作，只要 label 撞名，不相干的舊物件也會被一起抓進計算範圍。這也解釋了為什麼從 [Day 22](#day-22) 開始，新的 demo 物件都養成用專屬命名（`-hpa`、`-stateful` 這類字尾）跟舊物件區隔的習慣——這次剛好是沒做到位而踩坑的實例。
+- `resources.requests.cpu` 是這系列筆記第一次出現「資源需求宣告」，屬於 CKAD 考綱 `Application Environment, Configuration and Security` 這個 25% 佔比 Domain 底下的 `定義資源需求（resource requirements）` 知識點；不過這裡只示範了 `requests`（保留多少），還沒碰到 `limits`（上限多少）跟 `ResourceQuota`（整個 Namespace 的總量限制），這兩塊之後有機會再補。
+- 這篇是目前系列筆記中「原文技術債最重」的一篇——Heapster 被整個移除，等於原文的核心操作流程（裝 Heapster → HPA 讀 Heapster metrics）在現在的 Kubernetes 上完全走不通，跟前面幾天「語法還能寫、只是背後執行方式演進」（例如 [Day 20](#day-20) 的 AWS EBS in-tree plugin）不同，這篇是「示範用的元件已經不存在」等級的落差，直接反映了這系列筆記橫跨的時間（2018 年）對 Kubernetes 生態圈來說已經算蠻久遠。好在概念本身（根據資源使用率動態調整 Pod 數量）完全沒變，換掉底層元件跟語法版本後一樣能跑起來、行為也跟原文描述一致。
+- HPA／Autoscaling 本身**沒有明確出現在目前 CKAD 官方考綱的 5 大 Domain 條目裡**（跟 [Day 10](#day-10) 提過的 `nodeSelector` 類似，比較偏 CKA／進階維運範疇），但底層用到的 `resources.requests` 概念確實是 CKAD 考點，值得留意兩者的界線。
+
+## 小結
+
+- `HorizontalPodAutoscaler`（`autoscaling/v2`）透過 `scaleTargetRef` 指定要監控的 Deployment，搭配 `minReplicas`/`maxReplicas` 設定 Pod 數量上下限，`spec.metrics[].resource.target.averageUtilization` 設定觸發 scale 的 CPU 使用率門檻（實際門檻 = `requests.cpu` × 該百分比）。
+- HPA 支援用 `spec.behavior.scaleDown.stabilizationWindowSeconds` 設定縮容冷卻時間，避免使用率短暫波動就一直增減 Pod；取代了原文用來設定 Cluster 層級 flag 的舊版做法。
+- **已在目前的 minikube 上實際部署並驗證過完整流程**：啟用 `metrics-server` → 建立 Deployment/Service/HPA → 壓測讓 CPU 使用率超過門檻 → 實際觀察到 Pod 數量 `2 → 4 → 5` → 停止壓測後又自動縮回 `2`，符合 `minReplicas`/`maxReplicas` 的設定。
+- **踩坑記錄**：HPA 一開始因為 label selector 跟很早期（Day 5/9）留下的獨立 Pod `helloworld-pod` 衝突（該 Pod 沒有 `resources.requests.cpu`）而持續失敗，刪除那個舊 Pod 後才恢復正常——提醒之後建立新 demo 物件時，label 也要跟舊物件做好區隔，不能只顧著物件名稱。
+- 這篇原文示範的 Heapster 已經完全從 Kubernetes 移除，是目前筆記遇到技術債最重的一篇；本篇已經改用 `metrics-server` + `autoscaling/v2` + `apps/v1` 全部驗證過一輪，專案裡的 [demo-hpa](demo-hpa) 資料夾（`helloworld-depolyment.yaml`／`helloworld-hpa.yaml`／`helloworld-hpa-service.yaml`）就是實際使用的版本。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -2665,8 +2850,8 @@ drwxrwxrwx 2 root root 4096 Aug 15 05:00 .
 | --- | --- | --- |
 | CRD / Operators | 擴充 Kubernetes 資源 | 尚未涉及 |
 | Authentication / Authorization / Admission Control | 認證授權機制 | 尚未涉及 |
-| Requests / limits / quotas | 資源請求與限制 | 尚未涉及 |
-| 定義資源需求（resource requirements） | container resource requirements | 尚未涉及 |
+| Requests / limits / quotas | 資源請求與限制 | [Day 25](#day-25)（`requests` 部分，尚未涉及 `limits`／`ResourceQuota`） |
+| 定義資源需求（resource requirements） | container resource requirements | [Day 25](#day-25)（`spec.resources.requests.cpu`，尚未涉及 `limits`） |
 | ConfigMaps | 設定值管理 | [Day 18](#day-18)（`kubectl create configmap`、`--from-file`/`--from-literal`、`volumes.configMap` 掛載成檔案） |
 | Secrets | 機敏資料管理 | [Day 12](#day-12)（`kubectl create secret`、YAML+base64、環境變數／volume 掛載，尚未涉及搭配 Service Account 限制存取） |
 | ServiceAccounts | 服務帳號 | 尚未涉及 |
@@ -2682,7 +2867,7 @@ drwxrwxrwx 2 root root 4096 Aug 15 05:00 .
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
@@ -2690,4 +2875,5 @@ drwxrwxrwx 2 root root 4096 Aug 15 05:00 .
 - **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 [Day 21](#day-21) 的 `PersistentVolumeClaim` 動態要資源。
 - **Day 21 補充說明**：`StorageClass` + `PersistentVolumeClaim` 把 [Day 20](#day-20) 手動建立/記錄/回收 Volume 的流程自動化，`accessModes`（`ReadWriteOnce`/`ReadOnlyMany`/`ReadWriteMany`）與 `reclaimPolicy`（`Delete`/`Retain`）是這裡的核心考點；要留意不同 Volume Plugin 支援的 `accessModes` 不同（例如 AWS EBS 只支援 `ReadWriteOnce`），考試時容易忽略這個限制。
 - **Day 22 補充說明**：第一次把 `PersistentVolumeClaim`（Day 21）跟 `initContainer`（`Multi-container Pod design patterns` 這個考點）實際串起來部署驗證——PVC 不是只停留在 YAML 語法層面，而是實際刪除 Pod 重建、確認資料還在；`initContainer` 則示範了「正式 container 啟動前的一次性準備工作」這種常見 pattern，跟 `livenessProbe`（Day 11，服務啟動後持續檢查）是不同時間點的兩種機制，兩者都屬於 `Application Observability and Maintenance` 與 `Application Design and Build` 這兩個 Domain 常考的實作細節。
-- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
+- **Day 25 補充說明**：`resources.requests.cpu` 是 Environment/Config/Security Domain `定義資源需求`／`Requests/limits/quotas` 這兩個知識點第一次出現在筆記裡，但只涵蓋 `requests`，`limits` 與 `ResourceQuota` 仍待補；`HorizontalPodAutoscaler` 本身則沒有明確出現在目前 CKAD 官方考綱的 5 大 Domain 條目中（比較偏 CKA／進階維運範疇，跟 [Day 10](#day-10) 的 `nodeSelector` 狀況類似），準備考試可以降低這部分的優先度，但底層的 `resources.requests` 仍是實打實的考點。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）三塊，其餘 CRD/Operators、Authentication/Authorization、`limits`／`ResourceQuota`、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。

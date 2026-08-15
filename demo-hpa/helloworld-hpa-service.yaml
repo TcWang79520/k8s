@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: helloworld-hpa-service
+spec:
+  type: ClusterIP
+  selector:
+    app: helloworld-pod        # 👈 正確且唯一的 selector
+  ports:
+  - port: 3000
+    protocol: TCP
+    targetPort: 3000
