@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim    # 👈 這個欄位是絕對必填的！
+metadata:
+  name: myclaim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+  storageClassName: standard
