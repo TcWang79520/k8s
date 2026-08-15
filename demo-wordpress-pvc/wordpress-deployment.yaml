@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress-stateful
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wordpress-stateful
+  template:
+    metadata:
+      labels:
+        app: wordpress-stateful
+    spec:
+      # wordpress:4-php7.0 image 有個小 bug：掛載一個全新的空 volume 在
+      # /var/www/html/wp-content/uploads 底下時，權限預設是 root，
+      # www-data 使用者沒有寫入權限，上傳圖片會失敗，因此用 initContainer
+      # 先把權限打開，wordpress container 才能正常寫入
+      initContainers:
+      - name: fix-uploads-permission
+        image: busybox:1.36
+        command: ["sh", "-c", "chmod -R 777 /var/www/html/wp-content/uploads"]
+        volumeMounts:
+        - mountPath: /var/www/html/wp-content/uploads
+          name: wordpress-uploads
+      containers:
+      - name: wordpress
+        image: wordpress:4-php7.0
+        ports:
+        - name: wordpress-port
+          containerPort: 80
+        env:
+        - name: WORDPRESS_DB_HOST
+          value: mysql-stateful-service
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: db-password
+        - name: WORDPRESS_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: auth_key
+        - name: WORDPRESS_AUTH_SALT
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: auth_salt
+        - name: WORDPRESS_SECURE_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: secure_auth_key
+        - name: WORDPRESS_SECURE_AUTH_SALT
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: secure_auth_salt
+        - name: WORDPRESS_LOGGED_IN_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: logged_in_key
+        - name: WORDPRESS_LOGGED_IN_SALT
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: logged_in_salt
+        - name: WORDPRESS_NONCE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: nonce_key
+        - name: WORDPRESS_NONCE_SALT
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: nonce_salt
+        volumeMounts:
+        - mountPath: /var/www/html/wp-content/uploads
+          name: wordpress-uploads
+      volumes:
+      - name: wordpress-uploads
+        persistentVolumeClaim:
+          claimName: wordpress-uploads-pvc

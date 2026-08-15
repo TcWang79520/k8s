@@ -17,6 +17,7 @@
 - [Day 19](#day-19) - Ingress 與 Ingress Controller（負載平衡）
 - [Day 20](#day-20) - Volumes（資料持久化：emptyDir / hostPath / Cloud Storage / NFS）
 - [Day 21](#day-21) - Storage Class 與 PersistentVolumeClaim（動態產生 Volumes）
+- [Day 22](#day-22) - Demo：在 minikube 上架設 Stateful Wordpress（PVC + initContainer）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -44,6 +45,7 @@
 - **Ingress / Ingress Controller**：統一對外 port、以路徑（path）或 domain name 導流到不同 Service、SSL termination、Ingress Controller（Nginx/GCE）才是真正實現負載平衡的元件
 - **Volumes**：讓 container 資料持久化（stateless → stateful）、四種常用類型 `emptyDir`（隨 Pod 生滅）/ `hostPath`（隨 Node 生滅）/ Cloud Storage（AWS EBS 等）/ `NFS`、`volumes` + `volumeMounts` 掛載機制
 - **Storage Class / PersistentVolumeClaim**：`StorageClass`（定義 Volume 模板：provisioner / type / zone / `reclaimPolicy`）、`PersistentVolumeClaim`（依模板動態產生並綁定 Volume）、`accessModes`（`ReadWriteOnce` / `ReadOnlyMany` / `ReadWriteMany`）、Pod 以 `volumes.persistentVolumeClaim.claimName` 掛載
+- **Stateful Wordpress Demo**：MySQL／Wordpress 各自獨立 Deployment + PVC，靠 Service DNS 溝通；minikube 內建 `standard` StorageClass（`k8s.io/minikube-hostpath`）；`initContainer` 做正式 container 啟動前的一次性準備工作（修權限）
 
 
 # Day5
@@ -2255,6 +2257,364 @@ spec:
 - 原文 PVC 範例遺漏 `kind` 欄位、且誤植 `apiVersion` 為 `storage.k8s.io/v1`，筆記中已一併修正（見上方勘誤）；`kubernetes.io/aws-ebs` 這個 in-tree provisioner 目前也已 deprecated，新版 Cluster 建議改用 CSI 原生的 `ebs.csi.aws.com`。
 - 這篇沒有實際下指令操作，下一篇（Day 22）將延續前面在 AWS 架設的 Kubernetes Cluster，用今天學到的 `Storage Class`／`PersistentVolumeClaim`，把 [Day 13](#day-13) 的 Stateless Wordpress 升級成真正的 Stateful Wordpress。
 
+# Day 22
+
+> 參考來源：[[Day 22] 如何在 AWS 上打造 Stateful Wordpress Application](https://ithelp.ithome.com.tw/articles/10196674)
+
+## 前言：這篇筆記跟原文的差異
+
+原文延續前幾天在 AWS 上架設的 Kubernetes Cluster，示範怎麼把 [Day 13](#day-13) 的 Stateless Wordpress 升級成 Stateful 版本：MySQL 的資料目錄用 [Day 21](#day-21) 的 `StorageClass`/`PersistentVolumeClaim` 動態產生 AWS EBS 掛載，Wordpress 上傳的檔案（`wp-content/uploads`）則用 `aws-cli` 架一個 AWS EFS（NFS）掛載。
+
+但目前的網路環境沒辦法連到 AWS，所以這篇筆記改成**完全在本機 minikube 上**實作，核心概念不變（`PersistentVolumeClaim` 動態產生儲存空間、Pod 重建後資料仍在），但有兩處跟原文不同，**已跟使用者確認過**：
+
+1. **wp-content/uploads 也改用 PVC，不架 NFS**：原文用 `aws efs create-file-system` 建立真正的 NFS Server；在本機 VM 上另外架設 `nfs-kernel-server` 並讓 minikube 掛載，設定複雜且容易因 minikube driver（docker/none）不同而不穩定。改用第二個 `PersistentVolumeClaim`（一樣走 minikube 內建的 `standard` StorageClass 動態產生）取代，效果同樣是「資料獨立於 Pod/Node 之外持久保存」，只是底層儲存機制從 NFS 換成 hostPath-backed 的動態 Volume。
+2. **物件全部改用新名稱，不覆蓋 Cluster 裡既有的 Day 13 示範**：目前 Cluster 裡已經有 [Day 13](#day-13) 留下的 `wordpress-app`/`wordpress-service`（單一 Pod 兩個 container 的 Stateless 版本）與 [demo-wordpress-diff-pods](demo-wordpress-diff-pods)（`mysql-server`/`mysql-server-service`，Day 17 DNS 示範用），原文剛好也用 `mysql-server`/`mysql-server-service` 這幾個名字。為了不影響前面幾天已經在跑的示範，這篇的物件名稱都加上 `-stateful` 字尾，跟舊物件完全區隔。
+
+> 範例程式碼放在專案的 [demo-wordpress](demo-wordpress) 資料夾。
+
+## 架構
+
+跟 [Day 13](#day-13) 「一個 Pod 塞兩個 container、靠 `localhost` 溝通」不同，這篇比照原文把 MySQL 拆成獨立的 Deployment，兩邊透過 [Day 17](#day-17) 的 Service DNS 名稱溝通（跟 [demo-wordpress-diff-pods](demo-wordpress-diff-pods) 的拆法一樣，只是這次兩邊都掛了 PVC）：
+
+```
+┌─────────────────────┐        ┌──────────────────────┐
+│ Deployment           │        │ Deployment            │
+│ mysql-stateful        │◄──────┤ wordpress-stateful     │
+│ (mysql:5.7)           │  DNS  │ (wordpress:4-php7.0)  │
+│ /var/lib/mysql        │       │ /var/www/html/         │
+│  └─ mysql-server-pvc  │       │    wp-content/uploads  │
+└─────────────────────┘       │  └─ wordpress-uploads-pvc│
+        ▲                      └──────────────────────┘
+        │ Service (ClusterIP)              ▲
+        │ mysql-stateful-service            │ Service (NodePort 30302)
+        └───────────────────────────────────┘ wordpress-stateful-service
+```
+
+## 1. 建立兩個 PersistentVolumeClaim
+
+MySQL 的資料目錄跟 Wordpress 的上傳目錄各自需要一份持久化空間，直接沿用 [Day 21](#day-21) 學到的寫法，指定 `storageClassName: standard`——這個 `standard` 不用自己另外定義 `StorageClass`，**minikube 本身就內建一個名為 `standard` 的預設 StorageClass**（`provisioner: k8s.io/minikube-hostpath`，靠 `storage-provisioner` 這個 addon 動態產生 hostPath Volume），可以直接用 `kubectl get storageclass` 確認：
+
+```bash
+$ kubectl get storageclass
+NAME                 PROVISIONER                RECLAIMPOLICY   VOLUMEBINDINGMODE   AGE
+standard (default)   k8s.io/minikube-hostpath   Delete          Immediate           99d
+```
+
+```yaml
+# mysql-server-pvc.yaml
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: mysql-server-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard
+```
+
+```yaml
+# wordpress-uploads-pvc.yaml
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: wordpress-uploads-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard
+```
+
+> 原文請求 8Gi，這裡改成 1Gi——本機 minikube 只是示範用途，不需要真的預留那麼多空間，依實際需求調整即可。
+
+```bash
+$ kubectl create -f mysql-server-pvc.yaml
+persistentvolumeclaim/mysql-server-pvc created
+
+$ kubectl create -f wordpress-uploads-pvc.yaml
+persistentvolumeclaim/wordpress-uploads-pvc created
+
+$ kubectl get pvc mysql-server-pvc wordpress-uploads-pvc
+NAME                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+mysql-server-pvc        Bound    pvc-eb4011a2-6653-4ed9-956e-c9f7e760c245   1Gi        RWO            standard
+wordpress-uploads-pvc   Bound    pvc-b28b1329-c1e1-4086-9231-a62102e18163   1Gi        RWO            standard
+```
+
+兩個 PVC 都是 `Bound` 狀態，代表 minikube 已經在背後動態建好對應的 PersistentVolume 了。
+
+## 2. 建立 Secret 存放 Wordpress 所需的敏感資料
+
+跟 [Day 13](#day-13) 只存一組 `db-password` 不同，原文提到 Wordpress 官方建議另外設定 4 組加密用的 key（`AUTH_KEY`/`SECURE_AUTH_KEY`/`LOGGED_IN_KEY`/`NONCE_KEY`）增加安全性。查閱 [Wordpress 官方文件](https://developer.wordpress.org/apis/security-keys/)後發現，正確的作法其實需要 **4 組 KEY + 4 組對應的 SALT 共 8 個值**，原文的範例其實漏了一半（少了 `*_SALT`，`SECURE_AUTH_KEY` 也對錯了 env 名稱）。這篇筆記直接補齊成正確的 8 組，用 `openssl rand` 在本機產生亂數字串（不用連外部 API），示意如下：
+
+```bash
+$ openssl rand -base64 48 | tr -d '\n'
+1XUHU/s8Lu8CcBc4ikwbkr+oojZ+34QejUPVYn6U8Wnv/9RMxvekMBvIPJENN1nw
+```
+
+```yaml
+# wordpress-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wordpress-stateful-secret
+type: Opaque
+data:
+  # echo -n "wordpressRoot123" | base64
+  db-password: d29yZHByZXNzUm9vdDEyMw==
+  # 以下 8 組皆為 openssl rand -base64 48 產生後再 base64 編碼
+  auth_key: MVhVSFUvczhMdThDY0JjNGlrd2Jrcitvb2paKzM0UWVqVVBWWW42VThXbnYvOVJNeHZla01CdklQSkVOTjFudw==
+  auth_salt: QVpzYU1jZExiVVFFNUo4Q1ZxeDgzQlpMZXNQMUJPMTRURHdSVVFxMTh0UWIyMStVYVljT1FUNlZPdVZQd0tDWQ==
+  secure_auth_key: bVVqZmJVWFRabDZ3bVRlbEpNWTNzTnczV3VQMGdmbmxRZTJkNWJhV052OWRSWnhINlRwUGs3THhBWFhxck9ucA==
+  secure_auth_salt: bG1jbXZ0RVpBajhESUgrcm8rM1FjRTlLbTdhYU5IR0NaMjU2b3J1T203bEt0Z0Zkd0Uya1VrRm1BMzRoa3hyRA==
+  logged_in_key: ZkZSTWtab2ZsTHZjRXJ3dWlFdkROaEw5SWtNbGpwVWM3ZFpOQXFOTklDcW9NVlFlZWYvSmx5L09lanNxMGI4ZQ==
+  logged_in_salt: d1BGQTVhMTJDbm52K1FtL0JQRlQ2SjQ3VE5VdzJNMTQ1RlgzVjdlRnFQMnFoNm4yczUxZjJvanliUFdwd3B3Vg==
+  nonce_key: SGdqRzEzUGxnMzJIeW1SYkZJTnEwTFkxbi9HWlFqdkFQTmtHbVdWams1K3doUlFJTjhDVnFycVZHcXp4UDJUZg==
+  nonce_salt: ODFmR1RrMCtHd095R1FNS1NDZkk5VlUzVDZTT3JHKzFXbGtpV1luc2ZSZ0QxeXRCREpBUFBmNHdRTmZEa3N1Qw==
+```
+
+```bash
+$ kubectl create -f wordpress-secret.yaml
+secret/wordpress-stateful-secret created
+```
+
+## 3. 設定 MySQL Deployment 與 Service
+
+跟原文一樣，`mysql-server-storage` 這個 volume 指到剛剛建立的 PVC，掛載在 `/var/lib/mysql`（MySQL 實際存放資料的路徑）：
+
+```yaml
+# mysql-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-stateful
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-stateful
+  template:
+    metadata:
+      labels:
+        app: mysql-stateful
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        args:
+          - "--ignore-db-dir=lost+found"
+        ports:
+        - name: mysql-port
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: db-password
+        volumeMounts:
+        - mountPath: "/var/lib/mysql"
+          name: mysql-server-storage
+      volumes:
+      - name: mysql-server-storage
+        persistentVolumeClaim:
+          claimName: mysql-server-pvc
+```
+
+```yaml
+# mysql-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-stateful-service
+spec:
+  ports:
+  - port: 3306
+    protocol: TCP
+  selector:
+    app: mysql-stateful
+  type: ClusterIP
+```
+
+> 原文的 `mysql-server-service` 用 `NodePort`；這裡只有 `wordpress-stateful` 這個 Pod 需要連到 MySQL，不需要曝露給叢集外部，改用 `ClusterIP`（Kubernetes 預設類型）即可，行為跟 [Day 9](#day-9) 提過的 `ClusterIP` 一致。
+
+```bash
+$ kubectl create -f mysql-deployment.yaml
+deployment.apps/mysql-stateful created
+
+$ kubectl create -f mysql-service.yaml
+service/mysql-stateful-service created
+
+$ kubectl rollout status deployment/mysql-stateful
+deployment "mysql-stateful" successfully rolled out
+```
+
+## 4. 設定 Wordpress Deployment 與 Service
+
+`wordpress-uploads` 這個 volume 指到 `wordpress-uploads-pvc`，掛載在 `/var/www/html/wp-content/uploads`；`WORDPRESS_DB_HOST` 則直接指向 `mysql-stateful-service` 這個 Service 名稱（[Day 17](#day-17) `kube-dns` 機制）：
+
+```yaml
+# wordpress-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress-stateful
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wordpress-stateful
+  template:
+    metadata:
+      labels:
+        app: wordpress-stateful
+    spec:
+      initContainers:
+      - name: fix-uploads-permission
+        image: busybox:1.36
+        command: ["sh", "-c", "chmod -R 777 /var/www/html/wp-content/uploads"]
+        volumeMounts:
+        - mountPath: /var/www/html/wp-content/uploads
+          name: wordpress-uploads
+      containers:
+      - name: wordpress
+        image: wordpress:4-php7.0
+        ports:
+        - name: wordpress-port
+          containerPort: 80
+        env:
+        - name: WORDPRESS_DB_HOST
+          value: mysql-stateful-service
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: wordpress-stateful-secret
+              key: db-password
+        - name: WORDPRESS_AUTH_KEY
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: auth_key}
+        - name: WORDPRESS_AUTH_SALT
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: auth_salt}
+        - name: WORDPRESS_SECURE_AUTH_KEY
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: secure_auth_key}
+        - name: WORDPRESS_SECURE_AUTH_SALT
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: secure_auth_salt}
+        - name: WORDPRESS_LOGGED_IN_KEY
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: logged_in_key}
+        - name: WORDPRESS_LOGGED_IN_SALT
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: logged_in_salt}
+        - name: WORDPRESS_NONCE_KEY
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: nonce_key}
+        - name: WORDPRESS_NONCE_SALT
+          valueFrom:
+            secretKeyRef: {name: wordpress-stateful-secret, key: nonce_salt}
+        volumeMounts:
+        - mountPath: /var/www/html/wp-content/uploads
+          name: wordpress-uploads
+      volumes:
+      - name: wordpress-uploads
+        persistentVolumeClaim:
+          claimName: wordpress-uploads-pvc
+```
+
+> **原文「註一」提到的 bug**：`wordpress:4-php7.0` image 掛上一個全新的空 Volume 在 `/var/www/html/wp-content/uploads` 後，該目錄權限預設是 `root`，Apache 的 `www-data` 使用者沒有寫入權限，後台上傳圖片會失敗。原文的解法是**手動 `kubectl exec` 進 Pod 修改權限**；這裡改用 `initContainer` 在 `wordpress` container 啟動前，用 `busybox` 先把 `wp-content/uploads` 的權限打開，不需要每次重建 Pod 都手動處理一次，也符合 [Day 22 的 CKAD 考點](#ckad-test) 中 `Multi-container Pod design patterns`（init container 模式）。
+
+```yaml
+# wordpress-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress-stateful-service
+spec:
+  ports:
+  - port: 3000
+    nodePort: 30302
+    protocol: TCP
+    targetPort: wordpress-port
+  selector:
+    app: wordpress-stateful
+  type: NodePort
+```
+
+> 原文用 `type: LoadBalancer` 搭配 AWS 的 LoadBalancer 服務；minikube 沒有真的雲端 LoadBalancer（`kubectl get svc` 的 `EXTERNAL-IP` 會卡在 `<pending>`），改用跟 [Day 13](#day-13)／[demo-wordpress-diff-pods](demo-wordpress-diff-pods) 一致的 `NodePort`（挑一個還沒被用掉的 `30302`），可以直接用 `minikube service` 取得存取網址。
+
+```bash
+$ kubectl create -f wordpress-deployment.yaml
+deployment.apps/wordpress-stateful created
+
+$ kubectl create -f wordpress-service.yaml
+service/wordpress-stateful-service created
+
+$ kubectl rollout status deployment/wordpress-stateful
+deployment "wordpress-stateful" successfully rolled out
+```
+
+## Demo：驗證資料真的「Stateful」
+
+**1. 確認 Wordpress 能連上 MySQL、開啟安裝精靈**
+
+```bash
+$ minikube service wordpress-stateful-service --url
+http://192.168.49.2:30302
+
+$ curl -sIL http://192.168.49.2:30302
+HTTP/1.1 302 Found
+Location: http://192.168.49.2:30302/wp-admin/install.php
+HTTP/1.1 200 OK
+```
+
+用瀏覽器打開該網址，會直接被導到 `wp-admin/install.php` 的 Wordpress 安裝精靈——代表 `wordpress-stateful` 已經透過 `mysql-stateful-service` 成功連上 MySQL。
+
+**2. 驗證 uploads 目錄可寫入（initContainer 權限修正生效）**
+
+```bash
+$ kubectl exec wordpress-stateful-xxx -c wordpress -- ls -la /var/www/html/wp-content/uploads
+drwxrwxrwx 2 root root 4096 Aug 15 04:45 .
+
+$ kubectl exec wordpress-stateful-xxx -c wordpress -- touch /var/www/html/wp-content/uploads/test-persist.txt
+```
+
+**3. 刪掉 Pod，確認新 Pod 掛上同一個 PVC 後資料還在**
+
+```bash
+$ kubectl delete pod wordpress-stateful-xxx
+pod "wordpress-stateful-xxx" deleted
+
+$ kubectl rollout status deployment/wordpress-stateful
+deployment "wordpress-stateful" successfully rolled out
+
+$ kubectl exec wordpress-stateful-yyy -c wordpress -- ls -la /var/www/html/wp-content/uploads
+drwxrwxrwx 2 root root 4096 Aug 15 05:00 .
+-rwxrwxrwx 1 root root    0 Aug 15 05:00 test-persist.txt
+```
+
+`test-persist.txt` 在 Pod 被刪除、Deployment 產生新 Pod 之後依然存在——**同一份資料被新的 Pod 接續讀到，這就是 Stateful 的具體證明**。用同樣的方式刪除 `mysql-stateful` 的 Pod 重新驗證，新 Pod 的 `/var/lib/mysql` 底下也讀得到原本的資料庫檔案（`auto.cnf`、憑證等），沒有觸發 MySQL 的全新初始化流程。
+
+## 我的想法
+
+- 這篇是把 [Day 12](#day-12) Secret、[Day 17](#day-17) DNS Service Discovery、[Day 21](#day-21) PersistentVolumeClaim 這幾天學到的元件，第一次真正組合成一個「資料不會因為 Pod 重建而消失」的完整應用，正好回應了 [Day 13](#day-13) 尾聲留下、[Day 20](#day-20) 小結裡也提過的那個坑。
+- 拿掉 AWS 依賴後才更清楚看出：`Storage Class`/`PersistentVolumeClaim` 這組機制本身完全不綁定雲端服務商——minikube 內建的 `k8s.io/minikube-hostpath` provisioner 跟 [Day 21](#day-21) 示範的 `kubernetes.io/aws-ebs` provisioner，對 Pod 來說是完全透明、可互換的實作細節，Pod 端的 YAML（`volumes.persistentVolumeClaim.claimName`）完全不用改，這正是 `PersistentVolumeClaim` 這層抽象存在的意義。
+- 這次用 `initContainer` 解決原文手動 `kubectl exec` 修權限的問題，是 CKAD 考綱 `Multi-container Pod design patterns` 這個知識點第一次在筆記裡有實際範例：`initContainer` 保證會在主要 container 啟動前執行完畢，很適合拿來做這種「正式服務啟動前的一次性準備工作」，跟 [Day 11](#day-11) `livenessProbe` 的「服務啟動後持續檢查」是不同時間點的兩種機制。
+
+## 小結
+
+- 用兩個 `PersistentVolumeClaim`（`mysql-server-pvc`、`wordpress-uploads-pvc`）取代原文的「AWS EBS + AWS EFS」，兩者都掛在 minikube 內建的 `standard` StorageClass 上動態產生，不需要额外安裝任何元件。
+- MySQL 與 Wordpress 拆成兩個獨立 Deployment，靠 Service DNS 名稱（`mysql-stateful-service`）溝通，比 [Day 13](#day-13) 「兩個 container 塞一個 Pod」更貼近實務上「一個 Pod 負責一件事」的做法。
+- 補齊了原文遺漏的 4 組 Wordpress `*_SALT`，用 `openssl rand` 在本機產生，不依賴外部 API。
+- 用 `initContainer` 取代原文手動 `kubectl exec` 修改 `wp-content/uploads` 權限的做法，Pod 重建也不需要再手動處理一次。
+- 實際刪除 Pod 驗證：`wordpress-stateful` 與 `mysql-stateful` 的 Pod 被刪除重建後，`wp-content/uploads` 與 `/var/lib/mysql` 底下的資料都還在，證實了 PVC 掛載的資料確實獨立於 Pod 生命週期之外——`Stateless Wordpress`（Day 13）到 `Stateful Wordpress`（Day 22）的升級到此完成。
+- 因為全程用新命名（`-stateful` 字尾）建立物件，[Day 13](#day-13) 的 `wordpress-app`/`wordpress-service` 與 [demo-wordpress-diff-pods](demo-wordpress-diff-pods) 的 `mysql-server`/`mysql-server-service` 完全沒被動到，之前幾天的示範仍然可以正常運作、對照閱讀。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -2277,8 +2637,8 @@ spec:
 | --- | --- | --- |
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
 | Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
-| Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類） |
-| Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制）、[Day 21](#day-21)（`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume、`accessModes`、`reclaimPolicy`） |
+| Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類）、[Day 22](#day-22)（`initContainer` 實例：在 wordpress container 啟動前用 busybox 修正 uploads 目錄權限） |
+| Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制）、[Day 21](#day-21)（`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume、`accessModes`、`reclaimPolicy`）、[Day 22](#day-22)（實際部署驗證：PVC 掛載的資料在 Pod 刪除重建後依然存在） |
 
 ## 20% - Application Deployment
 
@@ -2322,11 +2682,12 @@ spec:
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
 - **Day 19 補充說明**：`Ingress` 只是規則設定檔，真正負責轉發、負載平衡的是額外部署的 `Ingress Controller`，兩者是「宣告 vs. 執行」的分工——這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 是同樣的分工模式，考試時要留意兩者缺一不可。
 - **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 [Day 21](#day-21) 的 `PersistentVolumeClaim` 動態要資源。
 - **Day 21 補充說明**：`StorageClass` + `PersistentVolumeClaim` 把 [Day 20](#day-20) 手動建立/記錄/回收 Volume 的流程自動化，`accessModes`（`ReadWriteOnce`/`ReadOnlyMany`/`ReadWriteMany`）與 `reclaimPolicy`（`Delete`/`Retain`）是這裡的核心考點；要留意不同 Volume Plugin 支援的 `accessModes` 不同（例如 AWS EBS 只支援 `ReadWriteOnce`），考試時容易忽略這個限制。
+- **Day 22 補充說明**：第一次把 `PersistentVolumeClaim`（Day 21）跟 `initContainer`（`Multi-container Pod design patterns` 這個考點）實際串起來部署驗證——PVC 不是只停留在 YAML 語法層面，而是實際刪除 Pod 重建、確認資料還在；`initContainer` 則示範了「正式 container 啟動前的一次性準備工作」這種常見 pattern，跟 `livenessProbe`（Day 11，服務啟動後持續檢查）是不同時間點的兩種機制，兩者都屬於 `Application Observability and Maintenance` 與 `Application Design and Build` 這兩個 Domain 常考的實作細節。
 - 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
