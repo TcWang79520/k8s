@@ -16,6 +16,7 @@
 - [Day 18](#day-18) - ConfigMap（配置與程式碼分離）
 - [Day 19](#day-19) - Ingress 與 Ingress Controller（負載平衡）
 - [Day 20](#day-20) - Volumes（資料持久化：emptyDir / hostPath / Cloud Storage / NFS）
+- [Day 21](#day-21) - Storage Class 與 PersistentVolumeClaim（動態產生 Volumes）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -42,6 +43,7 @@
 - **ConfigMap**：`kubectl create configmap`（`--from-file` / `--from-literal`）、非機密的部署配置（與 Secret 的機密資料互補）、以 `volumes.configMap` 掛載成檔案供 container 使用
 - **Ingress / Ingress Controller**：統一對外 port、以路徑（path）或 domain name 導流到不同 Service、SSL termination、Ingress Controller（Nginx/GCE）才是真正實現負載平衡的元件
 - **Volumes**：讓 container 資料持久化（stateless → stateful）、四種常用類型 `emptyDir`（隨 Pod 生滅）/ `hostPath`（隨 Node 生滅）/ Cloud Storage（AWS EBS 等）/ `NFS`、`volumes` + `volumeMounts` 掛載機制
+- **Storage Class / PersistentVolumeClaim**：`StorageClass`（定義 Volume 模板：provisioner / type / zone / `reclaimPolicy`）、`PersistentVolumeClaim`（依模板動態產生並綁定 Volume）、`accessModes`（`ReadWriteOnce` / `ReadOnlyMany` / `ReadWriteMany`）、Pod 以 `volumes.persistentVolumeClaim.claimName` 掛載
 
 
 # Day5
@@ -2122,6 +2124,137 @@ Volumes:
 - 本篇實作示範用 `aws-cli` 建立 AWS EBS，再透過 `volumes.awsElasticBlockStore` 掛載到 Pod；**原文所用的 in-tree plugin 寫法目前已 deprecated，新版 Cluster 需搭配 AWS EBS CSI Driver 才能運作**（見上方勘誤）。
 - 下一篇（Day 21）主題：`Storage Class` 與 `PersistentVolumeClaim`——不必再透過 `aws-cli` 等外部指令手動建立 Volume，而是能用 `kubectl` 搭配 YAML 設定檔動態產生所需的 Volumes，對管理多個 Volumes 更有幫助。
 
+# Day 21
+
+> 參考來源：[[Day 21] 如何管理大量的 Volumes - Storage Class](https://ithelp.ithome.com.tw/articles/10196604)
+
+## 前言：手動管理 Volumes 的痛點
+
+[Day 20](#day-20) 示範了如何用 `aws-cli` 手動建立一顆 AWS EBS，取得 `VolumeID` 後，再透過 YAML 把它掛載到指定 Pod 底下。如果只有一兩個 Pod 需要掛載 Volumes，這樣的流程還不算麻煩；但當今天要處理數以千計的 Pod，且每個 Pod 對 Volume 的型態、大小、所在地需求都不同時，手動建立、手動記錄 `VolumeID`、Pod 消失後還要手動回頭刪除沒在使用的 Volumes，就會變得非常擾人且難以管理。
+
+Kubernetes 為此提供了 [Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes) 這組機制：不只能幫忙定義每個 Volumes 物件的規格（`Storage Class`），還能依據當下需求動態產生對應的 Volumes（`PersistentVolumeClaim`），並統一管理這些 Volumes 的使用狀態。
+
+> 以 AWS EBS 為例，當 Pod 停止運行、該 EBS 不再被任何服務掛載時，Kubernetes 還能依照回收政策自動幫忙從 AWS 上銷毀該資源，避免被收取不必要的費用，大大提升 Volume 的彈性與可用性。
+
+今天筆記涵蓋兩個新物件，以及如何把兩者串起來使用：
+
+- `Storage Class`
+- `PersistentVolumeClaim`
+- 如何把動態產生的 Volume 掛載在特定 Pod 中
+
+> 範例程式碼可參考原文附的 [demo-storage-class](https://github.com/zxcvbnius/k8s-30-day-sharing/tree/master/Day21/demo-storage-class)。
+
+## Storage Class
+
+類似程式語言中「類別（Class）」的概念，透過 `Storage Class` 這個元件，可以依據 Volumes 的**提供者（provisioner）、類型（type）、所在地（Region），以及回收政策（reclaimPolicy）**去定義不同規格的 Storage Class 模板。
+
+```yaml
+# ebs-standard-storage-class.yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: standard
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp2
+  zone: us-west-2
+reclaimPolicy: Delete
+```
+
+- **apiVersion**：目前 api 版號為 `storage.k8s.io/v1`。
+- **metadata.name**：定義該 StorageClass 物件的名稱。
+- **provisioner**：這裡指定用 AWS 的 EBS 服務當作儲存空間的提供者。
+- **parameters.type**：定義 EBS 的種類；若 `provisioner` 為 `kubernetes.io/aws-ebs` 但沒設定該值，預設為 `gp2`。
+- **parameters.zone**：希望該 EBS 放在 AWS 的 `us-west-2（Oregon）` 這個 region。**要注意 AWS EBS 只能供 EC2 使用，且 EBS 所在地必須與 EC2 相同**。
+- **reclaimPolicy**：由該 Storage Class 產出的 Volumes，在綁定的 Pod 消失後的行為。Kubernetes 提供兩種型別：`Delete`（Pod 消失後，Volume 對應的資源如 EBS 會自動一併移除，無需再手動刪除）與 `Retain`（行為與直接在 Pod 定義檔中指定 Volume 相同，Pod 消失後 Volume 對應的資源仍會保留）。StorageClass 預設行為為 `Delete`。
+
+> Kubernetes 官網也列出了所有支援 Storage Class 的供應商（Provisioner），除了 AWS EBS plugin 之外，還提供多種雲端硬碟類型的 plugin。
+
+## PersistentVolumeClaim
+
+`PersistentVolumeClaim`（PVC）可以透過設定好的 Storage Class 模板，動態產生所需要的儲存資源。不再需要像 [Day 20](#day-20) 那樣事先手動建立好外部儲存資源（例如已架好的 NFS，或先申請好的 AWS EBS、GCE Persistent Disk），而是可以依照 Cluster 內部的需求**動態產生**對應的儲存區塊，並與 Cluster 中其他物件綁定（bind）使用。解除綁定後，PVC 也會依照 Storage Class 設定的回收機制（Reclaim Policy），決定要保留還是刪除該 Volume。
+
+```yaml
+# my-persistent-volume-claim.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: myclaim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+  storageClassName: standard
+```
+
+- **apiVersion**：PersistentVolumeClaim 屬於核心 API，版號為 `v1`。
+- **metadata.name**：定義該 PersistentVolumeClaim 物件的名稱。
+- **spec.accessModes**：Kubernetes 提供三種 [Access Modes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes)：
+  - **ReadWriteOnce**：產生出來的 Volume 同時只能掛載在同一個 Node 上讀寫。
+  - **ReadOnlyMany**：可以同時在多個 Node 上提供讀取功能。
+  - **ReadWriteMany**：可以同時在多個 Node 上提供讀寫功能。
+- **spec.resources.requests.storage**：請求的儲存空間大小，這裡是 8 GB。
+- **spec.storageClassName**：指定要用哪個 Storage Class 作為模板，這裡指定剛剛建立的 `standard`。如此 Kubernetes 就會依照該 Storage Class 的定義，在 AWS 建立一顆 8G、位於 Oregon 的 EBS。
+
+> 並非每種 [Volume Plugin](https://kubernetes.io/docs/concepts/storage/storage-classes/#provisioner) 都支援全部三種 Access Modes。以 AWS EBS 為例，只支援 `ReadWriteOnce`，同時間只能讓一個 Node 讀寫；選用 Volume Plugin 前，需先確認它能否滿足應用端的需求。
+
+## 如何將動態產生的 Volume 掛載在特定 Pod 中
+
+設定好 PersistentVolumeClaim 後，可以把這個動態產生的 PVC 與指定的 Pod 綁定：
+
+```yaml
+# my-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apiserver
+  labels:
+    app: apiserver
+    tier: backend
+spec:
+  containers:
+  - name: my-pod
+    image: zxcvbnius/docker-demo
+    ports:
+    - containerPort: 3000
+    volumeMounts:
+    - name: my-pvc
+      mountPath: "/tmp"
+  volumes:
+  - name: my-pvc
+    persistentVolumeClaim:
+      claimName: myclaim
+```
+
+跟 [Day 20](#day-20) 的寫法比起來，多了 `spec.containers.volumeMounts` 與 `spec.volumes` 這兩個欄位（其實掛載機制完全相同，只是 `volumes[]` 底下換成 `persistentVolumeClaim` 這個類型）：
+
+- **spec.containers.volumeMounts.name**：指定要用的 volume 名稱。
+- **spec.containers.volumeMounts.mountPath**：希望在 container 中掛載的路徑。
+- **spec.volumes.name**：給這個 Volume 一個名稱，供 `spec.containers.volumeMounts.name` 對應使用。
+- **spec.volumes.persistentVolumeClaim.claimName**：指定要使用的 PersistentVolumeClaim 物件名稱。
+
+如此，下次建立 `apiserver` 這個 Pod 時，Kubernetes 就會自動找到對應的 PVC 資源，並把 Volume 掛載到該 Pod 底下；即便 Pod 消失，資料依然可以被保存下來。
+
+> **勘誤**：
+> 1. **原文 PVC 範例缺少 `kind: PersistentVolumeClaim`**：原文 `my-persistent-volume-claim.yaml` 只寫了 `apiVersion: v1` 與 `metadata`，漏掉了 `kind` 欄位；YAML 定義檔缺少 `kind` 無法被 `kubectl create` 正確辨識為 PersistentVolumeClaim，上方範例已補上。另外原文說明 PVC 的 `apiVersion` 為 `storage.k8s.io/v1`，這其實是沿用了 Storage Class 段落的說明、貼錯的筆誤——PersistentVolumeClaim 屬於核心 API（`v1`），並非 `storage.k8s.io/v1`（`StorageClass` 才是）。
+> 2. **in-tree AWS EBS provisioner 已淘汰**：跟 [Day 20](#day-20) 的 `awsElasticBlockStore` 一樣，`provisioner: kubernetes.io/aws-ebs` 屬於 in-tree（內建）plugin，自 Kubernetes 1.17 起已 deprecated，1.23 起預設透過 CSI migration 轉譯給 [AWS EBS CSI Driver](https://github.com/kubernetes-sigs/aws-ebs-csi-driver) 處理；較新版本的 Cluster 需額外安裝 `aws-ebs-csi-driver` 這個 add-on 才能運作，若是全新建置的 Cluster，建議直接把 `provisioner` 改成 CSI 原生的 `ebs.csi.aws.com`。
+
+## 我的想法
+
+- 這篇的核心是把 [Day 20](#day-20) 「手動用 `aws-cli` 建立 Volume、記 `VolumeID`、手動掛載、手動回收」的整套流程自動化：`Storage Class` 負責定義「這類 Volume 長什麼樣子」（模板），`PersistentVolumeClaim` 負責「跟模板要一份資源」（動態產生 + 綁定），Pod 只要引用 PVC 的名字即可，完全不用碰底層雲端服務的細節，這跟 [Day 8](#day-8) Deployment 幫忙管理 Pod、不必手動操作 Replica Set 是類似的「自動化 + 抽象一層」的設計思路。
+- `Storage Class` 的 `reclaimPolicy`（`Delete` / `Retain`）本質上就是把 [Day 20](#day-20) 提到的「Volume 生命週期光譜」變成可設定的參數：`Delete` 讓動態產生的 Volume 跟著 PVC/Pod 一起消滅（像 `emptyDir` 那樣好清理），`Retain` 則讓它獨立存活（像手動掛載的 Cloud Storage 那樣持久），選型時一樣是依「這份資料需要活多久」決定。
+- PVC 的 `accessModes`（`ReadWriteOnce`/`ReadOnlyMany`/`ReadWriteMany`）補上了 [Day 20](#day-20) 沒特別談到的一個面向：Volume 能不能同時被多個 Node 讀寫。這點在替多 Pod 應用選型 Volume Plugin 時是常被忽略的限制（例如 AWS EBS 就只支援 `ReadWriteOnce`），跟 CKAD 考綱裡的 `Utilize persistent and ephemeral volumes` 直接相關。
+
+## 小結
+
+- `Storage Class` 定義 Volume 的模板（提供者、類型、所在地、回收政策），`PersistentVolumeClaim` 依模板動態產生實際的儲存資源並與 Cluster 物件綁定，取代了 [Day 20](#day-20) 手動建立、手動記錄、手動回收 Volume 的流程。
+- `reclaimPolicy` 決定 PVC 綁定的 Pod 消失後，底層資源（如 AWS EBS）要跟著自動刪除（`Delete`，預設值）還是保留（`Retain`）。
+- Pod 要使用動態產生的 Volume，只需在 `spec.volumes` 底下用 `persistentVolumeClaim.claimName` 指到對應的 PVC 名稱，掛載機制（`volumeMounts`）與 [Day 20](#day-20) 完全相同。
+- 原文 PVC 範例遺漏 `kind` 欄位、且誤植 `apiVersion` 為 `storage.k8s.io/v1`，筆記中已一併修正（見上方勘誤）；`kubernetes.io/aws-ebs` 這個 in-tree provisioner 目前也已 deprecated，新版 Cluster 建議改用 CSI 原生的 `ebs.csi.aws.com`。
+- 這篇沒有實際下指令操作，下一篇（Day 22）將延續前面在 AWS 架設的 Kubernetes Cluster，用今天學到的 `Storage Class`／`PersistentVolumeClaim`，把 [Day 13](#day-13) 的 Stateless Wordpress 升級成真正的 Stateful Wordpress。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -2145,7 +2278,7 @@ Volumes:
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
 | Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
 | Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類） |
-| Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制，尚未涉及 `PersistentVolume`/`PersistentVolumeClaim`/`StorageClass`） |
+| Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制）、[Day 21](#day-21)（`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume、`accessModes`、`reclaimPolicy`） |
 
 ## 20% - Application Deployment
 
@@ -2189,10 +2322,11 @@ Volumes:
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20，尚缺 PersistentVolume/PersistentVolumeClaim/StorageClass）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
 - **Day 19 補充說明**：`Ingress` 只是規則設定檔，真正負責轉發、負載平衡的是額外部署的 `Ingress Controller`，兩者是「宣告 vs. 執行」的分工——這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 是同樣的分工模式，考試時要留意兩者缺一不可。
-- **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；CKAD 考綱這裡真正的重點其實是**下一篇（Day 21）** 的 `PersistentVolume` / `PersistentVolumeClaim`（這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 PVC 動態要資源）。
+- **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 [Day 21](#day-21) 的 `PersistentVolumeClaim` 動態要資源。
+- **Day 21 補充說明**：`StorageClass` + `PersistentVolumeClaim` 把 [Day 20](#day-20) 手動建立/記錄/回收 Volume 的流程自動化，`accessModes`（`ReadWriteOnce`/`ReadOnlyMany`/`ReadWriteMany`）與 `reclaimPolicy`（`Delete`/`Retain`）是這裡的核心考點；要留意不同 Volume Plugin 支援的 `accessModes` 不同（例如 AWS EBS 只支援 `ReadWriteOnce`），考試時容易忽略這個限制。
 - 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）與 ConfigMaps（Day 18）兩塊，其餘 CRD/Operators、Authentication/Authorization、Requests/limits/quotas、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
