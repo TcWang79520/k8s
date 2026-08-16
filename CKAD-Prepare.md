@@ -5,6 +5,7 @@
 - [公用知識](#公用知識)
 - [題目1 - CronJob 手動觸發 Job](#題目1---cronjob-手動觸發-job)
 - [題目2 - CronJob 建立（不需手動觸發）](#題目2---cronjob-建立不需手動觸發)
+- [題目3 - 用 Dockerfile 建置並匯出 OCI 格式 image](#題目3---用-dockerfile-建置並匯出-oci-格式-image)
 
 ## 公用知識
 
@@ -57,3 +58,36 @@ kubectl apply -f CKAD/cronjob-2.yaml
 
 - 這題的 `activeDeadlineSeconds: 10` 放在 `jobTemplate.spec.template.spec`（Pod 層級），跟題目1 放在 `jobTemplate.spec`（Job 層級）位置不同——兩者都是合法欄位但語意不同：Job 層級是「整個 Job 從建立起算的存活時間上限」，Pod 層級是「這個 Pod 從啟動起算的存活時間上限」，考試讀 yaml 時要留意欄位縮排在哪一層
 - `restartPolicy: OnFailure` 跟題目1 的 `Never` 不同，代表 container 失敗時 kubelet 會在同一個 Pod 內重啟 container，而不是讓 Job controller 建立新 Pod
+
+## 題目3 - 用 Dockerfile 建置並匯出 OCI 格式 image
+
+**題目敘述**：
+
+已存在一個 Dockerfile 於 `/ckad/DF/Dockerfile`。
+
+1. 使用該 Dockerfile 建置一個名為 `centos`、標籤為 `8.2` 的 image（系統預裝了 docker、skopeo、buildah、img、podman 等多種工具可自行選用）。**不要** push 到 registry、**不要**執行 container、**不要**以其他方式使用它。
+2. 以 **OCI 格式**匯出建好的 image，存到 `/ckad/DF/centos-8.2.tar`。
+
+> 這題實際考試時要先切換到對應的 cluster/node 才能執行，模擬環境不需要切換。
+
+**相關資源**：`/ckad/DF/Dockerfile`（考場既有檔案，非本專案內容）
+
+**解法指令**：
+
+```bash
+cd /ckad/DF
+sudo docker build -t centos:8.2 .
+sudo docker save centos:8.2 > /ckad/DF/centos-8.2.tar
+```
+
+**對應考綱 Domain**：
+
+`Application Design and Build`（20%）→ `Define, build and modify container images`（這是筆記系列裡第一次涉及這個知識點）
+
+**易錯點／踩坑筆記**：
+
+- 選擇只用 `docker`（build + save）而不用 `skopeo copy` 轉檔，是因為**不能保證考試環境一定有裝 skopeo**，只依賴系統一定會有的工具比較保險——這題「系統預裝了多種工具可自行選用」的用意就是讓考生挑一個自己有把握、且確定可用的組合，不用堅持湊出「最標準」的解法
+- 要留意：`docker save` 匯出的嚴格來說是 **Docker 自家的 image archive 格式**（`manifest.json` + `repositories`），跟 `skopeo`/`buildah push oci-archive:` 產生的**標準 OCI archive 格式**（`index.json` + `oci-layout`）不完全相同；如果考試評分是嚴格檢查 `oci-layout` 這類 OCI 規格檔案，`docker save` 可能不算過關，實際考場如有餘裕可以用 `docker manifest inspect` 或解壓 tar 確認內容物、或改用 `podman save --format oci-archive` 這種同樣不依賴額外工具、但明確聲明 OCI 格式的指令來對照
+- `sudo` 是因為 docker daemon 通常需要 root 權限操作（除非有另外設定 rootless docker 或把使用者加進 `docker` 群組）
+- 題目明確要求「不要 push、不要 run、不要以其他方式使用」，build 完千萬別手滑多打 `docker run` 或 `docker push`，考試會直接扣分
+- image 名稱與標籤要精確符合 `centos:8.2`，大小寫、冒號位置都不能錯
