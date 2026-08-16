@@ -20,6 +20,7 @@
 - [Day 22](#day-22) - Demo：在 minikube 上架設 Stateful Wordpress（PVC + initContainer）
 - [Day 25](#day-25) - Horizontal Pod Autoscaling（自動擴縮 Pod 數量）
 - [Day 27](#day-27) - Namespaces 與 ResourceQuota（團隊/專案資源隔離）
+- [Day 31](#day-31) - StatefulSet（原教學系列沒教的元件，補充篇）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -50,6 +51,7 @@
 - **Stateful Wordpress Demo**：MySQL／Wordpress 各自獨立 Deployment + PVC，靠 Service DNS 溝通；minikube 內建 `standard` StorageClass（`k8s.io/minikube-hostpath`）；`initContainer` 做正式 container 啟動前的一次性準備工作（修權限）
 - **Horizontal Pod Autoscaling**：`resources.requests.cpu`（資源請求）、`HorizontalPodAutoscaler`（`autoscaling/v2`：`scaleTargetRef`/`minReplicas`/`maxReplicas`/`metrics[].resource.target.averageUtilization`/`behavior.scaleDown.stabilizationWindowSeconds`）、metrics-server（已啟用並實測 scale up/down）、HPA 依 label selector 抓 metrics 導致衝突的踩坑經驗
 - **Namespaces / ResourceQuota**：`kubectl create namespace`、`kubectl config set-context --current --namespace=`（切換預設 namespace）、`ResourceQuota`（`requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` 運算資源、`services`/`secrets`/`configmaps`/`replicationcontrollers` 物件數量）、刪除 namespace 會級聯刪除底下所有物件、Kubernetes 自動產生的 `kube-root-ca.crt` ConfigMap 會計入 quota
+- **StatefulSet**：`volumeClaimTemplates`（每個 replica 各自專屬 PVC）、headless Service（`clusterIP: None`）+ `spec.serviceName`、Pod 穩定命名（`<name>-<序號>`）與穩定 DNS（`<pod>.<service>.<ns>.svc.cluster.local`）、`podManagementPolicy`（`OrderedReady`/`Parallel`）、`updateStrategy`（`RollingUpdate`/`OnDelete`）
 
 
 # Day5
@@ -3009,6 +3011,140 @@ No resources found in hellospace namespace.
 - **已在目前的 minikube 上實際部署並驗證**：`hellospace` 建立當下 `configmaps` quota 就被系統自動產生的 `kube-root-ca.crt` 占滿（現在的 Kubernetes 不再自動產生 Secret，原文示範的「已有一個 secret」現象改發生在 configmap 上）；`secrets` quota 則正常示範了「第一個成功、第二個被拒絕」；最後刪除 `hellospace` 也驗證了 namespace 級聯刪除的特性。
 - 專案裡的 [demo-namespace/hellospace.yaml](demo-namespace/hellospace.yaml) 已經修正了原文 yaml 重複 `requests.memory` key 的 bug，換成正確的 `limits.memory: 10Gi`。
 
+# Day 31
+
+> 參考來源：這系列教學文章（Day 1~30）從頭到尾都沒有教到這個元件，是自己補上的一篇；改參考 [Kubernetes 官方文件 - StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/)。
+>
+> 這篇只整理概念與 yaml 範例，**沒有在目前的 minikube 上實際部署**（比照 [Day 20](#day-20)/[Day 21](#day-21) 當初的寫法）。
+
+## 前言：教學系列漏教的一塊拼圖
+
+回頭看這系列筆記，[Day 20](#day-20)～[Day 22](#day-22) 花了三天講 `Volumes`／`PersistentVolumeClaim`／Stateful Wordpress，但示範方式全部是「**一個 Deployment（`replicas: 1`）+ 手動指定一個固定名稱的 PVC**」——[Day 22](#day-22) 的 `mysql-stateful` 就是這樣做的。這種寫法在「只需要一份資料庫」的情境下沒問題，但只要想把 replica 數開到 2 個以上做高可用（例如 MySQL 主從、Kafka、Zookeeper、Elasticsearch 這類叢集式的 stateful 應用），這種寫法就會直接卡住：多個 Pod 會全部搶同一個 PVC，`ReadWriteOnce` 甚至會讓後面的 Pod 直接掛載失敗，就算是 `ReadWriteMany` 也無法讓每個 Pod 各自擁有獨立的一份資料。
+
+Kubernetes 針對這個情境提供了原生的解法：`StatefulSet`。這篇筆記把它補進來，今天涵蓋：
+
+- StatefulSet 是什麼、解決什麼問題
+- 為什麼 StatefulSet 一定要搭配 headless Service
+- yaml 範例：`volumeClaimTemplates` 怎麼讓每個 replica 各自擁有專屬 PVC
+- 跟 Deployment 的差異對照
+- 幾個容易忽略、但不需要實際部署也該知道的行為（PVC 生命週期、更新策略）
+
+## StatefulSet 是什麼
+
+`StatefulSet` 是專門管理 **stateful 應用** 的 workload 資源，跟 [Day 8](#day-8) 的 `Deployment` 一樣都會建立、管理一組 Pod，但多了三個 Deployment 沒有的特性：
+
+- **穩定、唯一的網路身份**：StatefulSet 產生的 Pod 名稱是固定格式 `<StatefulSet 名稱>-<序號>`（序號從 `0` 開始，例如 `web-0`、`web-1`、`web-2`），不像 Deployment 的 Pod 名稱帶隨機字串。就算 Pod 被刪除重建，**新 Pod 還是用同一個名稱**，不會變成 `web-3`。
+- **穩定的持久化儲存**：透過 `spec.volumeClaimTemplates`，StatefulSet 會替**每一個 replica 各自動態產生一個專屬的 PVC**（PVC 命名規則是 `<template 名稱>-<StatefulSet 名稱>-<序號>`，例如 `www-web-0`、`www-web-1`）。`web-0` 這個 Pod 不管被刪除重建幾次、被排程到哪個 Node，永遠都接回 `www-web-0` 這顆 PVC，不會跟其他 replica 共用或搞混。
+- **有順序的部署與擴縮**：Pod 依序號**由小到大**依序建立——`web-0` 要先進入 `Running and Ready` 狀態，才會開始建立 `web-1`，以此類推；刪除或縮容則反過來，**由大到小**依序進行。這個順序保證由 `spec.podManagementPolicy` 控制，預設值是 `OrderedReady`；如果不需要順序保證（例如 replica 之間完全對等，沒有主從關係），可以設成 `Parallel` 讓所有 Pod 同時建立。
+
+跟 [Day 21](#day-21) 學過的 `PersistentVolumeClaim` 對照：`PersistentVolumeClaim` 是「手動宣告一份儲存需求」，`volumeClaimTemplates`則是「**宣告一個模板，讓 Kubernetes 依 replica 數量自動生成多份 PVC**」——概念相通，差別只在「一份」還是「一份模板、自動生出多份」。
+
+## 為什麼一定要搭配 headless Service
+
+StatefulSet 的「穩定網路身份」需要靠一個 **headless Service**（`spec.clusterIP: None`）才能實現。一般 Service（[Day 9](#day-9) 學過的 `ClusterIP`/`NodePort`/`LoadBalancer`）會分配一個虛擬 IP，流量打到這個 IP 會被隨機轉發到背後某一個 Pod；但 headless Service **不會**分配虛擬 IP，而是讓 DNS 查詢直接回傳所有符合 selector 的 Pod IP。
+
+搭配 StatefulSet 使用時，[Day 17](#day-17) 學過的 `kube-dns` 機制會更進一步，替**每一個 Pod** 都產生一筆穩定的 DNS 紀錄：
+
+```
+<Pod 名稱>.<headless Service 名稱>.<Namespace>.svc.cluster.local
+```
+
+例如 `web-0.nginx.default.svc.cluster.local` 會固定指向 `web-0` 這個 Pod。這是 [Day 17](#day-17) DNS 機制的延伸：一般 Service 只保證「**服務層級**」的名稱穩定（不管背後是哪個 Pod 在回應），headless Service + StatefulSet 則進一步保證「**Pod 層級**」的名稱也穩定，讓叢集裡的其他成員可以指名道姓地連到特定一個 replica（例如資料庫叢集裡，其他節點要固定連到某個節點做主從同步）。
+
+## yaml 範例
+
+以官方文件經典的簡化版 nginx StatefulSet 為例：
+
+```yaml
+# nginx-headless-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  clusterIP: None
+  ports:
+  - port: 80
+    name: web
+  selector:
+    app: nginx
+```
+
+- **spec.clusterIP: None**：這行是 headless Service 的關鍵，告訴 Kubernetes 不要分配虛擬 IP。
+
+```yaml
+# web-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: web
+spec:
+  serviceName: nginx
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+          name: web
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+- **spec.serviceName: nginx**：一定要指到上面那個 headless Service 的名稱，這是 StatefulSet 產生 Pod DNS 紀錄的依據。
+- **spec.replicas: 3**：會依序建立 `web-0`、`web-1`、`web-2` 三個 Pod。
+- **spec.volumeClaimTemplates**：寫法跟單獨宣告一個 [Day 21](#day-21) 的 `PersistentVolumeClaim` 幾乎一樣（`accessModes`、`storageClassName`、`resources.requests.storage`），差別是這裡會依 `replicas` 數量各自產生一份，也就是 `www-web-0`、`www-web-1`、`www-web-2` 三個獨立的 PVC，各自綁定不同的底層 Volume。
+
+## 跟 Deployment 的差異對照
+
+| 面向 | Deployment | StatefulSet |
+| --- | --- | --- |
+| Pod 命名 | 隨機字串後綴（如 `web-64596c8797-c9p76`） | 固定序號（如 `web-0`、`web-1`） |
+| 儲存 | 要嘛不掛 Volume，要嘛所有 replica 共用同一個手動指定的 PVC（見 [Day 22](#day-22)） | `volumeClaimTemplates` 讓每個 replica 各自一份專屬 PVC |
+| 網路身份 | 一般 Service，流量隨機打到某個 Pod | 需搭配 headless Service，每個 Pod 各自有穩定 DNS |
+| 建立/刪除順序 | 沒有順序保證，同時建立 | 預設依序號由小到大建立、由大到小刪除（`OrderedReady`） |
+| 適合場景 | 無狀態應用（[Day 13](#day-13) 的 Wordpress 前端、[Day 25](#day-25) 的 helloworld 都是這種） | 需要多個 replica、各自獨立身份與儲存的 stateful 應用（資料庫叢集、Kafka、Zookeeper 等） |
+
+## 幾個容易忽略的行為
+
+- **刪除 StatefulSet 或縮容，`volumeClaimTemplates` 產生的 PVC 不會自動被刪除**：這是刻意的資料保護設計，避免不小心縮容或刪除整個 StatefulSet 就把資料庫的資料一起清空。要真的釋放這些儲存空間，得手動 `kubectl delete pvc`。這點比 [Day 21](#day-21) 提過的 `reclaimPolicy: Retain` 還要更保守一層——`Retain` 是「Volume 不會消失」，這裡是「連 PVC 這個物件本身都不會消失」，要主動介入才會清掉。
+- **更新策略 `spec.updateStrategy`**：預設是 `RollingUpdate`，依序號**由大到小**依序更新（跟建立順序相反）；也可以設成 `OnDelete`，這種模式下即使改了 Pod template，Kubernetes 也不會自動套用，要等使用者手動刪除某個 Pod，新 Pod 才會用新版本的設定重建——適合需要完全手動控管更新時機的場景。
+
+## 我的想法
+
+- 這篇本質上是把 [Day 21](#day-21) 的 `PersistentVolumeClaim` 動態產生機制，再往上包一層「依 replica 數量自動生成多份、且各自跟 Pod 身份綁定」的自動化——理解了 `PersistentVolumeClaim` 的欄位，`volumeClaimTemplates`幾乎是直接代換，只是多一層「這是模板，會生出好幾份」的概念。
+- headless Service 讓 [Day 17](#day-17) 的 DNS 機制從「服務層級」延伸到「Pod 層級」：一般 Service 是「不在乎背後是哪個 Pod 回應，只要有一個能用就好」，StatefulSet + headless Service 則是「就是要連到指定的那一個 Pod」，這正是資料庫主從架構、分散式系統節點間互相定址的核心需求。
+- 直接對照 [Day 22](#day-22)：如果當時的 `mysql-stateful` 想要做成 3 個節點的 MySQL 高可用叢集，光把 `replicas` 從 `1` 改成 `3` 是不夠的——`Deployment` 那種寫法所有 replica 會搶同一個 PVC；要正確做的話，得把 `Deployment` 換成 `StatefulSet`、`persistentVolumeClaim.claimName` 換成 `volumeClaimTemplates`。不過就算元件換對了，MySQL 多節點之間的主從複製設定（誰是 primary、怎麼同步）仍然是資料庫層面的工作，不是換一個 yaml 就會自動搞定，`StatefulSet` 只是把「每個節點有獨立身份與儲存」這個基礎打好。
+- 這是目前筆記系列裡**唯一一篇原文完全沒教、自己額外補上的內容**，某種程度上也印證了為什麼 CKAD 官方考綱會把 `StatefulSet` 明確跟 `Deployment`、`DaemonSet`、`CronJob` 並列在同一個知識點裡——這是繼 [Day 7](#day-7)/[Day 8](#day-8) 之後，這系列筆記第四種學到的 workload 資源類型，但前面三種（RC/RS/Deployment）都只處理無狀態或單一 replica 的情境，這篇補上的正是「多 replica 的 stateful 應用」這一塊。
+
+## 小結
+
+- `StatefulSet` 是 Kubernetes 處理「多 replica、各自需要穩定身份與儲存」這類 stateful 應用的原生元件，三大特性：**穩定命名**（`<name>-<序號>`）、**穩定儲存**（`volumeClaimTemplates`，每個 replica 各自一份 PVC）、**有順序的部署/擴縮**（`podManagementPolicy`）。
+- 一定要搭配 `clusterIP: None` 的 **headless Service**，`spec.serviceName` 指到它，才能讓每個 Pod 各自擁有 `<pod>.<service>.<ns>.svc.cluster.local` 這種穩定 DNS 名稱。
+- `volumeClaimTemplates` 的寫法跟 [Day 21](#day-21) 的 `PersistentVolumeClaim` 幾乎相同，差別在於它是模板、會依 `replicas` 數量各自產生獨立的 PVC；StatefulSet／PVC 被刪除或縮容時，這些 PVC **不會自動刪除**，需要手動清理。
+- 跟 [Day 22](#day-22) 「Deployment（單一 replica）+ 固定 PVC」的寫法對照：那種寫法只適合單一 replica 的 stateful 應用，一旦要多 replica 做高可用，就得換成 `StatefulSet`。
+- 這篇是這系列筆記原文完全沒教、自行補充的部分，只整理概念與 yaml 範例，沒有在目前的 minikube 上實際部署驗證。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -3030,7 +3166,7 @@ No resources found in hellospace namespace.
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | Define, build and modify container images | 建立/修改 container image（Docker 等） | 尚未涉及 |
-| Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)） |
+| Choose and use the right workload resource（Deployment、DaemonSet、CronJob 等） | 依需求選擇合適的 workload 物件來管理 Pod | [Day 7](#day-7)（Replication Controller）、[Day 8](#day-8)（Replica Set、Deployment，皆透過 `selector`／`matchLabels` 篩選管理對象，原理見 [Day 10](#day-10)）、[Day 31](#day-31)（`StatefulSet`：多 replica 的 stateful 應用，尚未涉及 `DaemonSet`／`CronJob`） |
 | Multi-container Pod design patterns（sidecar、init 等） | 同一 Pod 內多個 container 協作的設計模式 | [Day 6](#day-6)（提到同 Pod 內 container 可用 `localhost` 溝通）、[Day 13](#day-13)（實際範例：wordpress + mysql 兩個 container 放同一 Pod，靠 `localhost` 溝通，但尚未介紹 sidecar / init pattern 這種正式分類）、[Day 22](#day-22)（`initContainer` 實例：在 wordpress container 啟動前用 busybox 修正 uploads 目錄權限） |
 | Utilize persistent and ephemeral volumes | Volume 的使用 | [Day 20](#day-20)（`emptyDir`/`hostPath`/Cloud Storage/`NFS` 四種常用類型、`volumes`+`volumeMounts` 掛載機制）、[Day 21](#day-21)（`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume、`accessModes`、`reclaimPolicy`）、[Day 22](#day-22)（實際部署驗證：PVC 掛載的資料在 Pod 刪除重建後依然存在） |
 
@@ -3076,7 +3212,7 @@ No resources found in hellospace namespace.
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
@@ -3086,4 +3222,5 @@ No resources found in hellospace namespace.
 - **Day 22 補充說明**：第一次把 `PersistentVolumeClaim`（Day 21）跟 `initContainer`（`Multi-container Pod design patterns` 這個考點）實際串起來部署驗證——PVC 不是只停留在 YAML 語法層面，而是實際刪除 Pod 重建、確認資料還在；`initContainer` 則示範了「正式 container 啟動前的一次性準備工作」這種常見 pattern，跟 `livenessProbe`（Day 11，服務啟動後持續檢查）是不同時間點的兩種機制，兩者都屬於 `Application Observability and Maintenance` 與 `Application Design and Build` 這兩個 Domain 常考的實作細節。
 - **Day 25 補充說明**：`resources.requests.cpu` 是 Environment/Config/Security Domain `定義資源需求`／`Requests/limits/quotas` 這兩個知識點第一次出現在筆記裡，但只涵蓋 `requests`，`limits` 與 `ResourceQuota` 仍待補；`HorizontalPodAutoscaler` 本身則沒有明確出現在目前 CKAD 官方考綱的 5 大 Domain 條目中（比較偏 CKA／進階維運範疇，跟 [Day 10](#day-10) 的 `nodeSelector` 狀況類似），準備考試可以降低這部分的優先度，但底層的 `resources.requests` 仍是實打實的考點。
 - **Day 27 補充說明**：`ResourceQuota` 補上了 [Day 25](#day-25) 留下的 `limits`／配額缺口，把資源管控的層級從「單一 container」拉高到「整個 Namespace」；這次實測也發現一個容易忽略的細節——Kubernetes 會自動在每個 namespace 產生 `kube-root-ca.crt` 這個 ConfigMap，設定 `configmaps` 這類物件配額時要把這些自動產生的物件也算進去，不然配額可能一建立就被用光。`Namespaces` 本身雖然不是獨立的 CKAD 考綱條目，但幾乎是 `Requests/limits/quotas`、`ServiceAccounts`、`NetworkPolicies`（依 namespace 隔離網路流量）這幾個考點共同的基礎概念。
+- **Day 31 補充說明**：`StatefulSet` 是這系列筆記原文完全沒教、自行補充的內容，補上的是 `Choose and use the right workload resource` 這個知識點裡「多 replica 的 stateful 應用」這一塊；只整理概念與 yaml 範例，沒有像 [Day 22](#day-22)/[Day 25](#day-25)/[Day 27](#day-27) 那樣實際部署驗證，`DaemonSet`／`CronJob` 這兩個同一知識點下的其他 workload 類型也還沒涉及。
 - 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）四塊，其餘 CRD/Operators、Authentication/Authorization、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
