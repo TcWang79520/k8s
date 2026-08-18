@@ -1,0 +1,22 @@
+apiVersion: apps/v1 # from CKAD/ckad/goshawk/current-chipmunk-deployment.yaml
+kind: Deployment
+metadata:
+  name: canary-chipmunk-deployment #这个根据题目要求修改
+  namespace: goshawk
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: canary-chipmunk-deployment #作为区分标签
+      run: dep-svc #确保 current-chipmunk-deployment 和 canary-chipmunk-deployment 都有这个公用的标签。
+  template:
+    metadata:
+      labels:
+        app: canary-chipmunk-deployment
+        run: dep-svc
+    spec:
+      containers:
+      - name: nginx
+        image: vicuu/nginx:hi
+        ports:
+        - containerPort: 3000

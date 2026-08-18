@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nosql
+  namespace: haddock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nosql
+  template:
+    metadata:
+      labels:
+        app: nosql
+    spec:
+      containers:
+      - image: nginx:1.16
+        name: nginx
+        resources:
+          requests:
+            memory: "15Mi"
+          limits:
+            memory: "20Mi"

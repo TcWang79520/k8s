@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broker-deployment
+  namespace: quetzal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: broker-deployment
+  template:
+    metadata:
+      labels:
+        app: broker-deployment
+    spec:
+      containers:
+      - name: my-pod
+        image: zxcvbnius/docker-demo:latest
+        ports:
+        - containerPort: 3000
+        securityContext:
+          runAsUser: 30000
+          allowPrivilegeEscalation: false -- sudo、su，或某些惡意植入的 binary , 也無法透過這些機制提權成 root
