@@ -12,6 +12,8 @@
 - [題目8 - 修改 Deployment 的 SecurityContext（runAsUser / allowPrivilegeEscalation）](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation)
 - [題目9 - 建立 Deployment 並指定環境變數](#題目9---建立-deployment-並指定環境變數)
 - [題目10 - RBAC 授權除錯（ServiceAccount 權限不足）](#題目10---rbac-授權除錯serviceaccount-權限不足)
+- [題目11 - 建立 ConfigMap 並掛載成 Volume](#題目11---建立-configmap-並掛載成-volume)
+- [題目12 - 建立 Secret 並以環境變數使用](#題目12---建立-secret-並以環境變數使用)
 
 ## 公用知識
 
@@ -622,3 +624,186 @@ roleRef:
 - 「更新 Deployment 以解決錯誤」**有兩種同樣合法的修法**，考場上兩種都可能是預期答案：(1) 讓 `default` SA 直接拿到權限（幫 `default` 建 `Role`+`RoleBinding`，Deployment 完全不用動）；(2) 讓 Deployment **改用**另一個「已經有權限」的 SA（`kubectl set serviceaccount` 或直接改 `serviceAccountName`）。這題練習刻意選第二種，是因為更貼近「先查清楚 cluster 上已經準備了什麼」這個實務除錯習慣——**兩種修法都要先確認清楚「現在到底綁的是哪個 SA、那個 SA 有沒有權限」，不要沒查就先動手改**
 - `kubectl set serviceaccount`（別名 `kubectl set sa`）語法是 `kubectl set serviceaccount <resource> <name> <sa-name> -n <namespace>`——第一次打很容易打錯（例如漏打資源類型、資源名稱多打字），指令本身不接受打錯字的資源名稱，`kubectl` 會直接回報 `not found`，這種時候先用 `kubectl get deploy -n <ns>` 確認正確名稱再重打
 - 補完 RBAC 權限、或幫 Deployment 換了 SA 之後，**已經在跑的 Pod 不一定會自動重試成功**：要看應用程式的邏輯是「每次迴圈重新呼叫 API」（這種等下一輪自然就正常了，練習範例的 `while true` 迴圈就是這種）還是「開機時呼叫一次失敗就直接 crash」（這種要 `kubectl rollout restart deployment/honeybee-deployment -n gorilla` 讓它重新啟動、重新嘗試）；不過如果是**改 `serviceAccountName`**（不管用指令或改 yaml），Deployment 的 Pod template 一定會變更，本來就會觸發 rolling update、產生新 Pod，這種情況不用額外下 `rollout restart`
+
+## 題目11 - 建立 ConfigMap 並掛載成 Volume
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`default`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要建立一個 ConfigMap，並在一個 Pod 中使用這個 ConfigMap。
+
+**Task**：
+
+1. 在 namespace `default` 中建立一個名為 `some-config`、儲存以下 key/value 的 ConfigMap：
+   - `key3: value4`
+2. 在 namespace `default` 中建立一個名為 `nginx-configmap` 的 Pod。用 `nginx:stable` 映像檔指定一個容器。用儲存在 ConfigMap `some-config` 中的資料填充一個 Volume，並掛載在路徑 `/some/path`。
+
+**相關資源**：[CKAD/11-configmap.yaml](CKAD/11-configmap.yaml)
+
+**解法指令**（考試時的實際作法：能用指令式就用指令式，不熟的 flag 現場 `-h` 查）：
+
+```bash
+kubectl config use-context k8s
+
+# 1. ConfigMap 用指令式一步到位，忘記 flag 名稱就先查 help
+kubectl create configmap some-config -h
+kubectl create configmap some-config --from-literal=key3=value4
+
+# 2. Pod 要掛 Volume，kubectl run 沒有對應 flag，
+#    改用 --dry-run=client -o yaml 先產生骨架，再手動補 volumes/volumeMounts
+kubectl run nginx-configmap --image=nginx:stable --dry-run=client -o yaml > 11-pod.yaml
+# 編輯 11-pod.yaml，補上：
+#   volumeMounts: [{name: config-volume, mountPath: /some/path}]
+#   volumes: [{name: config-volume, configMap: {name: some-config}}]
+kubectl apply -f 11-pod.yaml
+```
+
+完整 yaml 對照（`kubectl apply -f CKAD/11-configmap.yaml` 也能一次到位，練習用兩種方式都跑過一次比較熟）：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: some-config
+  namespace: default
+data:
+  key3: value4
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-configmap
+  namespace: default
+spec:
+  containers:
+  - name: nginx
+    image: nginx:stable
+    volumeMounts:
+    - name: config-volume
+      mountPath: /some/path
+  volumes:
+  - name: config-volume
+    configMap:
+      name: some-config
+```
+
+**驗證**：
+
+```bash
+kubectl exec nginx-configmap -n default -- ls /some/path
+# key3
+
+kubectl exec -it nginx-configmap -n default -- cat /some/path/key3
+# value4
+```
+
+**對應考綱 Domain**：
+
+`Application Environment, Configuration and Security`（25%）→ `ConfigMaps`（延續 [Record.md Day 18](Record.md#day-18) 學過的 `kubectl create configmap`／`volumes.configMap` 掛載機制，這題是同一套知識點直接考出來的標準題型）
+
+**易錯點／踩坑筆記**：
+
+- **這題 namespace 是 `default`**，跟前面幾題（`pod-resources`/`haddock`/`goshawk`/`quetzal`/`ckad00014`/`gorilla`）都不一樣——`default` 是每個 cluster 天生就有的 namespace，**不用也不能用 `kubectl create namespace` 再建一次**，题目沒特別提到 namespace 時反而要留意是不是就是要用 `default`，不要因為前面題目慣性都要指定專屬 namespace，就自己多帶一個不存在的 `-n`
+- 用 `configMap` 掛成 Volume 時，**ConfigMap 裡的每一個 key 都會變成掛載目錄下的一個檔案**，檔名就是 key 名稱、檔案內容就是 value——這題 `key3: value4` 掛到 `/some/path` 之後，實際會出現 `/some/path/key3` 這個檔案，內容是 `value4`，這是跟 [Record.md Day 18](Record.md#day-18) 用環境變數方式掛 ConfigMap（`envFrom`/`valueFrom.configMapKeyRef`）完全不同的用法，題目明確說「填充卷（Volume）」就是要用 `volumes.configMap` 這種掛檔案的方式，不是環境變數
+- `mountPath: /some/path` 是**掛載到 container 內部檔案系統的路徑**，跟 container image 裡原本可能存在的目錄無關——如果該路徑在 image 裡本來就有檔案，掛上 ConfigMap Volume 後**原本的內容會被完全蓋掉**（覆蓋整個目錄，不是合併），這題掛在 `/some/path` 是全新路徑不影響 nginx 本身運作，但如果之後題目要求掛在 nginx 設定檔目錄之類的地方，要特別小心這個覆蓋行為
+- `data` 底下的 value 如果是純數字或看起來像特殊 YAML 值（`true`/`false`/`null` 等），保險起見也建議加引號寫成字串，跟 [題目9](#題目9---建立-deployment-並指定環境變數) 環境變數 `value` 欄位的坑是同一種道理；這題 `value4` 本身是字串沒有這個疑慮，純粹是通用習慣提醒
+- **考試時的原則：能用指令式（`kubectl create`/`kubectl run`）就不要手寫整份 yaml**，像這題的 `ConfigMap` 用 `kubectl create configmap some-config --from-literal=key3=value4` 一行就搞定，比手打 yaml 快很多也不容易漏欄位或縮排錯；不確定 flag 名稱時**現場 `-h` 查**（例如 `kubectl create configmap some-config -h` 會列出 `--from-literal`/`--from-file` 這些選項），比憑記憶硬猜可靠。跟 [題目1](#題目1---cronjob-手動觸發-job) 用 `kubectl create job -h` 查 `--from=cronjob/` 是同一個應試習慣
+- 但 **Pod 掛 Volume 這種比較複雜的 spec，`kubectl run`／`kubectl create` 都沒有對應的 flag 可以一次生成**，只能先用 `--dry-run=client -o yaml` 產生一份陽春骨架，再手動編輯補上 `volumes`/`volumeMounts` 這兩塊——指令式跟 yaml 編輯**是互補而不是二選一**，簡單的物件（ConfigMap/Secret 本身）用指令式建立最快，物件之間的「掛載關係」（Volume、envFrom 等）通常還是得回到 yaml 手動接起來
+- **驗證時 `kubectl exec` 沒帶 `-n` 也會踩到 namespace 坑**：這題實測過，練習前面幾題（[題目5](#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange)/[題目10](#題目10---rbac-授權除錯serviceaccount-權限不足)）切換過 `k8s` context 的預設 namespace（`kubectl config set-context --current --namespace=...`）之後，之後所有沒帶 `-n` 的指令都會打到那個殘留設定的 namespace，不是 `default`——`kubectl exec nginx-configmap`（沒帶 `-n default`）會直接 `Error from server (NotFound)`，因為 Pod 根本不在當前預設 namespace 裡。**下指令前養成先 `kubectl config view --minify -o jsonpath='{..namespace}'` 確認目前預設 namespace 的習慣**，比每次都用猜的可靠，或是乾脆每個指令都手動帶 `-n <namespace>`，不依賴預設值
+- `kubectl exec` 要執行「用某個 shell 執行一段指令」時，**`/bin/bash <command> <args>` 這種寫法是錯的**：`/bin/bash cat /some/path/key3` 會讓 bash 把 `cat` 當成**要讀取執行的 script 檔案路徑**，而不是「要執行 cat 這個指令」，因為 `cat` 是二進位檔不是文字腳本，會報錯 `cannot execute binary file`。正確寫法是**直接把指令放在 `--` 後面**（`kubectl exec ... -- cat /some/path/key3`，不需要 `/bin/bash`），或是真的要透過 shell 執行多段指令時用 `bash -c "指令"` 包起來（`-- bash -c "cat /some/path/key3"`）
+
+## 題目12 - 建立 Secret 並以環境變數使用
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`default`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要建立一個 Secret，並在一個 Pod 中使用這個 Secret。
+
+**Task**：
+
+1. 在 namespace `default` 中建立一個名為 `another-secret`、包含以下單一 key/value 的 Secret：
+   - `key1: value12`
+2. 在 namespace `default` 中建立一個名為 `nginx-secret` 的 Pod。用 `nginx:1.16` 映像檔指定一個容器。加一個名為 `COOL_VARIABLE` 的環境變數，值來自 Secret 的 `key1`。
+
+**相關資源**：[CKAD/12-secret.yaml](CKAD/12-secret.yaml)
+
+**解法指令**（考試時作法：跟 [題目11](#題目11---建立-configmap-並掛載成-volume) 同一套節奏——Secret 用指令式一步到位，Pod 的環境變數引用還是得回 yaml 手動接）：
+
+```bash
+kubectl config use-context k8s
+
+# 1. Secret 用指令式建立，不確定 flag 就現場查
+kubectl create secret generic another-secret -h
+kubectl create secret generic another-secret -n default --from-literal=key1=value12
+
+# 2. Pod 用 --dry-run 產生骨架，再手動補 env.valueFrom.secretKeyRef
+kubectl run nginx-secret -n default --image=nginx:1.16 --dry-run=client -o yaml > 12-pod.yaml
+# 編輯 12-pod.yaml，補上：
+#   env:
+#   - name: COOL_VARIABLE
+#     valueFrom:
+#       secretKeyRef:
+#         name: another-secret
+#         key: key1
+kubectl apply -f 12-pod.yaml
+```
+
+完整 yaml 對照（`kubectl apply -f CKAD/12-secret.yaml` 也能一次到位）：
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: another-secret
+  namespace: default
+type: Opaque
+stringData:
+  key1: value12
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-secret
+  namespace: default
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.16
+    env:
+    - name: COOL_VARIABLE
+      valueFrom:
+        secretKeyRef:
+          name: another-secret
+          key: key1
+```
+
+**驗證**：
+
+```bash
+kubectl exec -it nginx-secret -n default -- printenv COOL_VARIABLE
+# value12
+```
+
+**對應考綱 Domain**：
+
+`Application Environment, Configuration and Security`（25%）→ `Secrets`（延續 [Record.md Day 12](Record.md#day-12) 學過的 `kubectl create secret generic`、`secretKeyRef` 環境變數掛法，這題是同一套知識點直接考出來的標準題型，剛好跟 [題目11](#題目11---建立-configmap-並掛載成-volume) 的 ConfigMap 掛 Volume 形成對照）
+
+**易錯點／踩坑筆記**：
+
+- **這題用的是環境變數（`env.valueFrom.secretKeyRef`），不是 Volume**——跟 [題目11](#題目11---建立-configmap-並掛載成-volume) 剛好相反：題目11 說「填充卷」用 `volumes.secret`/`volumes.configMap`，這題說「加一個環境變數」就要用 `env.valueFrom.secretKeyRef`（單一 key）或 `envFrom.secretRef`（整包 Secret 全部變成環境變數）。看清楚題目要的是「掛檔案」還是「當環境變數」，這是這兩題唯一的本質差異，其他步驟幾乎一樣
+- `secretKeyRef` 底下要同時指定 `name`（Secret 物件名稱）跟 `key`（Secret 裡的哪個 key），這題是 `name: another-secret` + `key: key1`——只寫 `name` 沒寫 `key` 會直接 apply 失敗（`key` 是必填欄位）
+- 建立 Secret 時，**`kubectl create secret generic --from-literal` 建出來的值會自動 base64 編碼存進 `data` 欄位**，這是 Secret 跟 ConfigMap 最大的差異（ConfigMap 明文存在 `data`，Secret 是 base64 存在 `data`，或用 `stringData` 讓 Kubernetes 幫你自動轉換）；這份練習 yaml 用 `stringData: {key1: value12}` 明文寫，`kubectl apply` 之後 Kubernetes 會自動轉成 base64 存進 `data`，兩種寫法效果一樣，`stringData` 純粹是給人看的方便寫法
+- Container 裡讀出來的環境變數值**已經是解碼後的明文**（`value12`），不會是 base64 字串——base64 編碼只發生在 etcd 儲存層，Kubernetes 在把值注入環境變數／掛載成檔案的當下就已經自動解碼了，這題驗證 `printenv COOL_VARIABLE` 應該直接看到 `value12`，如果看到一串 base64 亂碼，代表 yaml 寫錯了（例如誤把 base64 值直接塞進 `stringData`）
+- 同樣要留意 [題目11](#題目11---建立-configmap-並掛載成-volume) 提過的殘留 namespace 坑：驗證指令記得帶 `-n default`，不要依賴當前 context 的預設 namespace
