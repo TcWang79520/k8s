@@ -21,6 +21,7 @@
 - [Day 25](#day-25) - Horizontal Pod Autoscaling（自動擴縮 Pod 數量）
 - [Day 27](#day-27) - Namespaces 與 ResourceQuota（團隊/專案資源隔離）
 - [Day 31](#day-31) - StatefulSet（原教學系列沒教的元件，補充篇）
+- [Day 32](#day-32) - ServiceAccount 與 RBAC（Role / RoleBinding，補充篇）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -3145,6 +3146,178 @@ spec:
 - 跟 [Day 22](#day-22) 「Deployment（單一 replica）+ 固定 PVC」的寫法對照：那種寫法只適合單一 replica 的 stateful 應用，一旦要多 replica 做高可用，就得換成 `StatefulSet`。
 - 這篇是這系列筆記原文完全沒教、自行補充的部分，只整理概念與 yaml 範例，沒有在目前的 minikube 上實際部署驗證。
 
+# Day 32
+
+> 跟 [Day 31](#day-31) 一樣，這篇是原教學系列完全沒教、自己額外補上的內容。起因是準備 CKAD 考古題時，[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足) 實際在 minikube 上跑出一個 RBAC `Forbidden` 錯誤，藉這個真實案例把 `ServiceAccount`、`Role`、`RoleBinding` 這組 CKAD 考綱裡 `ServiceAccounts` 與 `Authentication / Authorization / Admission Control` 兩個知識點一次搞懂，**已在本機 minikube 實際部署並驗證修復成功**。
+
+## 起因：一個真實冒出來的錯誤
+
+題目情境：namespace `gorilla` 底下有個 Deployment `honeybee-deployment`，裡面的 Pod 一直在 log 裡狂噴錯誤：
+
+```
+Error from server (Forbidden): serviceaccounts is forbidden:
+User "system:serviceaccount:gorilla:default" cannot list resource "serviceaccounts"
+in API group "" in the namespace "gorilla"
+```
+
+這個 Pod 的 container 其實只是不斷執行 `kubectl get serviceaccounts`（用來練習/展示用途），但每次呼叫都被 Kubernetes API server 拒絕。要看懂這行錯誤、進而修好它，得先搞懂兩個東西：**Pod 怎麼會有一個「使用者身份」可以拿去呼叫 API**（ServiceAccount），以及 **Kubernetes 怎麼判斷這個身份能不能做某件事**（RBAC：Role / RoleBinding）。
+
+## ServiceAccount：Pod 的「身份證」
+
+到目前為止，這系列筆記接觸過的「使用者」都是人類（你自己用 `kubectl` 操作 cluster，靠 kubeconfig 裡的憑證認證）。但 Pod 裡執行的程式，有時候也需要主動呼叫 Kubernetes API（例如這題的 `kubectl get serviceaccounts`，或是常見的 Operator、CI/CD 工具、監控 agent），這時候 Pod 需要一個屬於自己的身份，這就是 **ServiceAccount（SA）**。
+
+幾個關鍵事實：
+
+- **每個 namespace 都會自動產生一個名為 `default` 的 ServiceAccount**，這題的 `gorilla` namespace 也不例外：
+  ```bash
+  kubectl get sa default -n gorilla -o yaml
+  # apiVersion: v1
+  # kind: ServiceAccount
+  # metadata:
+  #   name: default
+  #   namespace: gorilla
+  ```
+- **每個 Pod 一定會用某個 ServiceAccount 運行**，沒有在 `spec.serviceAccountName` 明確指定的話，就是用該 namespace 的 `default`。這題的 `honeybee-deployment.yaml` 就是完全沒指定（或明確寫了 `serviceAccountName: default`，效果一樣）。
+- **Kubernetes 會自動把這個 SA 的憑證掛進 Pod 裡**，路徑固定在 `/var/run/secrets/kubernetes.io/serviceaccount/`，裡面有三個檔案：
+  ```bash
+  kubectl exec -n gorilla deploy/honeybee-deployment -- ls /var/run/secrets/kubernetes.io/serviceaccount/
+  # ca.crt      → API server 的 CA 憑證，用來驗證 API server 身份
+  # namespace   → 這個 Pod 所在的 namespace（gorilla）
+  # token       → 這個 SA 的身份令牌（JWT），呼叫 API 時當「密碼」用
+  ```
+  這也是為什麼 container 裡的 `kubectl` 完全沒帶任何登入參數，卻還是能連上 API server——`kubectl`、以及幾乎所有官方 client library，都會自動偵測「我是不是在 Pod 裡執行」，偵測到就直接讀這三個檔案組成連線設定，術語叫 **in-cluster config**。
+- **ServiceAccount 的身份格式固定是 `system:serviceaccount:<namespace>:<sa-name>`**——這題錯誤訊息裡的 `system:serviceaccount:gorilla:default`，拆開來看就是「`gorilla` namespace 底下的 `default` 這個 ServiceAccount」，不是什麼特殊帳號名稱叫 `default`，純粹是巧合每個 namespace 的自動 SA 都取名 `default`。
+
+跟 [Day 27](#day-27) 提過的內容連起來看：**早期（Kubernetes 1.24 之前）每個 ServiceAccount 會自動搭配產生一個長期有效的 Secret 存放 token**，現在改用 [TokenRequest API](https://kubernetes.io/docs/reference/access-authn-authz/service-account-issuer-discovery/) 動態核發、有效期較短的 token，直接以 **Projected Volume** 的形式掛進 Pod（就是上面看到的那三個檔案），不再是一個常駐的 Secret 物件——這就是為什麼 `honeybee-deployment` 這個 Pod 一起來就自動有身份可以用，完全不用你手動掛 Secret。
+
+## 為什麼「有身份」還是被拒絕：Authentication vs Authorization
+
+這題最容易搞混的地方是：**Pod 明明成功「表明了自己是誰」，為什麼還是被拒絕？** 因為 Kubernetes 的權限檢查分兩層：
+
+| 階段 | 英文 | 這題對應的狀態 | 回答的問題 |
+| --- | --- | --- | --- |
+| 認證（Authentication） | AuthN | ✅ 通過 | 你是誰？——`token` 驗證通過，確認你就是 `system:serviceaccount:gorilla:default` |
+| 授權（Authorization） | AuthZ | ❌ 沒通過 | 你能做這件事嗎？——沒有任何規則說 `gorilla:default` 可以 `list serviceaccounts`，所以被拒絕 |
+
+錯誤訊息裡的 `Forbidden`（HTTP 403）就是**認證通過、但授權失敗**的標準訊號——如果是認證沒過，會是 `Unauthorized`（HTTP 401）。這題要修的完全是授權層，也就是 RBAC。
+
+## RBAC 的兩層積木：Role 與 RoleBinding
+
+Kubernetes 預設走 **RBAC（Role-Based Access Control）** 模型，核心概念只有兩層，缺一不可：
+
+```
+┌─────────────────┐         ┌─────────────────┐
+│      Role        │         │   RoleBinding    │
+│  「能做什麼」      │ ◄────── │  「誰可以做」      │
+│                  │ roleRef │                  │
+│  rules:          │         │  subjects:       │
+│  - resources     │         │  - ServiceAccount│
+│  - verbs         │         │    / User / Group│
+└─────────────────┘         └─────────────────┘
+```
+
+- **`Role`**：一份「權限規則清單」，描述「對哪些資源（resources）、可以做哪些動作（verbs）」，本身不會生效，因為它沒有指定「誰」可以用這些規則
+- **`RoleBinding`**：把一個 `Role` 實際「發放」給某個身份（`subjects`：可以是 `ServiceAccount`、`User`、或 `Group`），身份跟權限規則要透過 `RoleBinding` 才會真正連在一起
+
+這題實際補上的 [`CKAD/10-rbac-fix.yaml`](CKAD/10-rbac-fix.yaml)：
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: honeybee-sa-lister
+  namespace: gorilla
+rules:
+- apiGroups: [""]              # ← "" 代表 core API group（Pod、Service、ServiceAccount 這些最基本的資源都在這裡）
+  resources: ["serviceaccounts"] # ← 針對哪個資源類型
+  verbs: ["list"]                # ← 允許的動作，這裡只開放「列出清單」
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: honeybee-sa-lister-binding
+  namespace: gorilla
+subjects:
+- kind: ServiceAccount            # ← 綁定給誰：這裡是一個 ServiceAccount（也可以是 User/Group）
+  name: default
+  namespace: gorilla               # ← ServiceAccount 這個 kind 一定要另外指定 namespace，因為 SA 是 namespace-scoped 物件
+roleRef:
+  kind: Role                       # ← 指到上面那個 Role
+  name: honeybee-sa-lister
+  apiGroup: rbac.authorization.k8s.io
+```
+
+逐欄拆解：
+
+- **`rules[].apiGroups`**：`""`（空字串）代表 **core API group**，Pod、Service、ConfigMap、Secret、ServiceAccount 這些「最原始」的資源都屬於這一組；像 `Deployment` 屬於 `apps` group、`Role` 自己屬於 `rbac.authorization.k8s.io` group，寫規則時要對到資源實際所屬的 group，寫錯 group 規則不會生效
+- **`rules[].verbs`**：常見的有 `get`（查單一物件）、`list`（列出多個）、`watch`（持續監聽變化）、`create`、`update`、`patch`、`delete`、`deletecollection`——這題錯誤訊息只要求 `list`，所以 `Role` 只開放 `list` 就好，**不要多給權限**（最小權限原則，也是 CKAD/資安概念裡的重要原則）
+- **`roleRef` 跟 `subjects` 缺一不可**：`RoleBinding` 沒有 `roleRef` 指到的 `Role`，`kubectl apply` 會直接報錯找不到；反過來只有 `Role` 沒有任何 `RoleBinding` 綁定，這個 `Role` 就只是一份沒人用得到的規則，Pod 還是會被拒絕
+
+## 完整請求流程圖
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Pod (honeybee-deployment)                                  │
+│                                                             │
+│  container 執行：kubectl get serviceaccounts               │
+│         │                                                   │
+│         │ 讀取掛載的 token/ca.crt/namespace                  │
+│         ▼                                                   │
+│  身份 = system:serviceaccount:gorilla:default               │
+└──────────────────────┬──────────────────────────────────┘
+                        │ 帶著 token 打 API server
+                        ▼
+        ┌───────────────────────────────┐
+        │ kube-apiserver                  │
+        │                                 │
+        │ ① Authentication（驗證 token）   │ ── 通過 ──►
+        │                                 │
+        │ ② Authorization（RBAC 檢查）     │
+        │    這個身份 + 這個 verb + 這個   │
+        │    resource，有沒有對應的       │
+        │    Role + RoleBinding？          │
+        └───────────────────────────────┘
+              │ 沒有 RoleBinding          │ 補上 Role+RoleBinding 後
+              ▼                          ▼
+        403 Forbidden               200 OK，回傳 serviceaccounts 清單
+```
+
+## Role vs ClusterRole，RoleBinding vs ClusterRoleBinding
+
+這題的 `serviceaccounts` 資源查詢只限定在單一 namespace（`gorilla`）內，所以用 namespace-scoped 的 `Role`/`RoleBinding` 就夠。如果今天要處理的是 **cluster-scoped 資源**（例如 `nodes`、`persistentvolumes`、`namespaces` 這些不屬於任何 namespace 的物件），或是想讓一個身份**能跨多個 namespace** 存取，就要換成 `ClusterRole`/`ClusterRoleBinding`：
+
+| | 授權範圍 | 能管理的資源 | 這題適用嗎 |
+| --- | --- | --- | --- |
+| `Role` + `RoleBinding` | 單一 namespace | namespace-scoped 資源（Pod、ServiceAccount、ConfigMap...） | ✅ 這題就是這樣修的 |
+| `ClusterRole` + `ClusterRoleBinding` | 整個 cluster | namespace-scoped **或** cluster-scoped 資源（Node、PV...） | 不需要，但如果要讓 `gorilla:default` 同時也能查 `haddock`、`quetzal` 的 serviceaccounts，就要改用這組 |
+
+還有一種常見混搭：**`ClusterRole` 搭配 `RoleBinding`**——把一份定義好的 `ClusterRole` 規則，透過 namespace-scoped 的 `RoleBinding` 只發放給單一 namespace 用，這樣就不用每個 namespace 都重複寫一份一樣的 `Role`，是很常見的「共用規則、各自授權範圍」設計，但這題規模小，直接寫一個 `Role` 更直觀。
+
+## 除錯技巧：`kubectl auth can-i`
+
+修完之後，不用真的等 Pod 下一輪迴圈才知道有沒有生效，`kubectl` 有專門模擬權限檢查的指令：
+
+```bash
+kubectl auth can-i list serviceaccounts -n gorilla --as=system:serviceaccount:gorilla:default
+# yes   ← 修好後的結果
+```
+
+`--as` 可以模擬「假如我是這個身份」去問 API server「這個動作准不准」，不用真的建一個 Pod 去試，是 RBAC 除錯（也是 CKAD 考試）最實用的工具之一。
+
+## 我的想法
+
+- 這次剛好把 Authentication／Authorization 這組概念跟前面學過的東西串起來看：[Day 12](#day-12) 學的 `Secret` 是「人類自己要用的機密資料」，這篇的 SA token 則是「Kubernetes 自動幫 Pod 準備的機密資料」——本質上都是敏感憑證，只是**誰在用**、**怎麼掛進 Pod** 不同：`Secret` 通常要你自己建立、自己決定怎麼掛載；SA token 是系統自動建立、自動用 in-cluster config 的慣例掛進固定路徑，兩者共用同一套「掛進 Pod 檔案系統」的底層機制。
+- `Role`/`RoleBinding` 的「規則」跟「綁定」分離設計，其實跟 [Day 8](#day-8)/[Day 10](#day-10) 學過的 Deployment `selector` + label 分離設計有點類似的哲學：**「定義一份東西」跟「決定套用給誰／套用到哪」永遠是兩個獨立步驟**，Kubernetes 幾乎每個子系統都遵循這個模式（Role 定義權限規則 vs RoleBinding 決定給誰；PersistentVolume 定義儲存資源 vs PersistentVolumeClaim 決定誰來用；ConfigMap/Secret 定義資料 vs Pod 的 volumeMounts 決定掛給哪個 container）。
+- 這題「debug 錯誤，邏輯稍微有點繞」的真正陷阱，不是 RBAC 語法本身很難，而是題目敘述容易讓人誤以為要去改 Deployment 的 yaml——但事實上 **Deployment 完全沒有問題，問題出在 RBAC 這個完全獨立的授權系統**，兩者是不同 API 資源、彼此互不相干，只是「Deployment 底下的 Pod 恰好因為權限不足而報錯」而已。
+
+## 小結
+
+- **ServiceAccount** 是 Pod 用來呼叫 Kubernetes API 的身份，每個 namespace 都有自動產生的 `default` SA，Pod 沒指定 `serviceAccountName` 就會用它；身份憑證（`token`/`ca.crt`/`namespace`）會自動掛進 Pod 的 `/var/run/secrets/kubernetes.io/serviceaccount/`，讓 `kubectl` 等 client 自動用 in-cluster config 連線。
+- Kubernetes 的權限檢查分兩層：**Authentication（你是誰，驗證 token）** 先過，才輪到 **Authorization（RBAC 判斷你能不能做這件事）**；這題錯誤是 AuthN 過了、AuthZ 沒過，對應的 HTTP 狀態是 `403 Forbidden`。
+- **RBAC 靠 `Role`（定義能做什麼：`apiGroups`/`resources`/`verbs`）+ `RoleBinding`（定義誰可以做：`subjects` 綁定到 `roleRef`）兩層積木組成**，兩者都是 namespace-scoped；要跨 namespace 或管理 cluster-scoped 資源，才需要換成 `ClusterRole`/`ClusterRoleBinding`。
+- `kubectl auth can-i --as=<identity>` 是驗證 RBAC 設定有沒有生效最快的方式，不用真的跑一個 Pod 去試。
+- 這題（[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足)）已在本機 minikube 實際部署 `honeybee-deployment.yaml`、重現 `Forbidden` 錯誤，再套用 `Role`+`RoleBinding` 驗證修復成功（`kubectl get serviceaccounts` 從 403 變成正常回傳清單）。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -3194,12 +3367,12 @@ spec:
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | CRD / Operators | 擴充 Kubernetes 資源 | 尚未涉及 |
-| Authentication / Authorization / Admission Control | 認證授權機制 | 尚未涉及 |
+| Authentication / Authorization / Admission Control | 認證授權機制 | [Day 32](#day-32)（Authentication 與 Authorization 兩階段檢查、RBAC 的 `Role`/`RoleBinding`/`ClusterRole`/`ClusterRoleBinding`，已實測部署驗證；`Admission Control` 尚未涉及） |
 | Requests / limits / quotas | 資源請求與限制 | [Day 25](#day-25)（container 層級 `requests`）、[Day 27](#day-27)（namespace 層級 `ResourceQuota`：`requests`/`limits`/物件數量配額，已實測驗證超額會被拒絕） |
 | 定義資源需求（resource requirements） | container resource requirements | [Day 25](#day-25)（`spec.resources.requests.cpu`，尚未涉及 `limits`） |
 | ConfigMaps | 設定值管理 | [Day 18](#day-18)（`kubectl create configmap`、`--from-file`/`--from-literal`、`volumes.configMap` 掛載成檔案） |
 | Secrets | 機敏資料管理 | [Day 12](#day-12)（`kubectl create secret`、YAML+base64、環境變數／volume 掛載，尚未涉及搭配 Service Account 限制存取） |
-| ServiceAccounts | 服務帳號 | 尚未涉及 |
+| ServiceAccounts | 服務帳號 | [Day 32](#day-32)（`ServiceAccount` 是 Pod 呼叫 API 的身份，`default` SA 自動產生、token 自動掛載為 in-cluster config，已實測部署驗證） |
 | SecurityContexts / Capabilities | 安全性設定 | 尚未涉及 |
 
 ## 20% - Services and Networking
@@ -3207,14 +3380,15 @@ spec:
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | NetworkPolicies | 網路流量控管規則 | 尚未涉及 |
-| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制）、[Day 17](#day-17)（`kube-dns`：Pod 之間透過 Service 名稱互相溝通，不受 Cluster IP 動態變動影響） |
+| 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制）、[Day 13](#day-13)（`containerPort`/`targetPort`/`port`/`nodePort` 四層 port 完整對照，是 Service 連線除錯最常見的考點）、[Day 17](#day-17)（`kube-dns`：Pod 之間透過 Service 名稱互相溝通，不受 Cluster IP 動態變動影響） |
 | Ingress | 對外路由規則 | [Day 19](#day-19)（Ingress 依路徑/domain name 導流、SSL termination、Ingress Controller 實現負載平衡） |
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）、`ServiceAccount` 與 RBAC `Role`/`RoleBinding` 實際部署驗證（Day 32，原教學系列沒教、自行補充）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
+- **Day 13 補充說明**：「搞懂 Service Port / Pod Port / targetPort / nodePort」這節整理的四層 port 對照，是 CKAD 考古題裡多次出現的基礎知識——例如 [CKAD-Prepare.md 題目9](CKAD-Prepare.md#題目9---建立-deployment-並指定環境變數) 就實際碰到「`containerPort` 只是容器監聽 port 的宣告、不等於 Service 會自動轉發過去」這個常見誤解；核心心法是**同一個字「port」在四個不同層級各自代表不同東西**，`targetPort` 才是真正連結 Service 跟 Pod 實際監聽 port 的欄位，`containerPort` 更接近文件用途。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
 - **Day 19 補充說明**：`Ingress` 只是規則設定檔，真正負責轉發、負載平衡的是額外部署的 `Ingress Controller`，兩者是「宣告 vs. 執行」的分工——這跟 [Day 8](#day-8) Deployment 需要靠 Replica Set 才能實際管理 Pod 是同樣的分工模式，考試時要留意兩者缺一不可。
 - **Day 20 補充說明**：`emptyDir`/`hostPath`/`awsElasticBlockStore`/`nfs` 全都是套用同一組 `volumes` + `volumeMounts` 掛載機制（跟 [Day 12](#day-12) Secret、[Day 18](#day-18) ConfigMap 掛載成檔案完全同構），差別只在 `volumes[]` 底下資料來源的類型與生命週期長短；這幾天示範的都是直接在 Pod 裡宣告 Volume，屬於較底層的用法，實務與考試更常見的是透過 [Day 21](#day-21) 的 `PersistentVolumeClaim` 動態要資源。
@@ -3223,4 +3397,5 @@ spec:
 - **Day 25 補充說明**：`resources.requests.cpu` 是 Environment/Config/Security Domain `定義資源需求`／`Requests/limits/quotas` 這兩個知識點第一次出現在筆記裡，但只涵蓋 `requests`，`limits` 與 `ResourceQuota` 仍待補；`HorizontalPodAutoscaler` 本身則沒有明確出現在目前 CKAD 官方考綱的 5 大 Domain 條目中（比較偏 CKA／進階維運範疇，跟 [Day 10](#day-10) 的 `nodeSelector` 狀況類似），準備考試可以降低這部分的優先度，但底層的 `resources.requests` 仍是實打實的考點。
 - **Day 27 補充說明**：`ResourceQuota` 補上了 [Day 25](#day-25) 留下的 `limits`／配額缺口，把資源管控的層級從「單一 container」拉高到「整個 Namespace」；這次實測也發現一個容易忽略的細節——Kubernetes 會自動在每個 namespace 產生 `kube-root-ca.crt` 這個 ConfigMap，設定 `configmaps` 這類物件配額時要把這些自動產生的物件也算進去，不然配額可能一建立就被用光。`Namespaces` 本身雖然不是獨立的 CKAD 考綱條目，但幾乎是 `Requests/limits/quotas`、`ServiceAccounts`、`NetworkPolicies`（依 namespace 隔離網路流量）這幾個考點共同的基礎概念。
 - **Day 31 補充說明**：`StatefulSet` 是這系列筆記原文完全沒教、自行補充的內容，補上的是 `Choose and use the right workload resource` 這個知識點裡「多 replica 的 stateful 應用」這一塊；只整理概念與 yaml 範例，沒有像 [Day 22](#day-22)/[Day 25](#day-25)/[Day 27](#day-27) 那樣實際部署驗證，`DaemonSet`／`CronJob` 這兩個同一知識點下的其他 workload 類型也還沒涉及。
-- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）四塊，其餘 CRD/Operators、Authentication/Authorization、ServiceAccounts、SecurityContexts 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
+- **Day 32 補充說明**：`ServiceAccount` 與 RBAC（`Role`/`RoleBinding`）是這系列筆記原文完全沒教、因準備 CKAD 考古題（[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足)）實際踩到 `Forbidden` 錯誤才回頭補充的內容，一次補齊 `ServiceAccounts` 跟 `Authentication / Authorization / Admission Control` 兩個知識點裡的 Authentication／Authorization 部分（`Admission Control` 仍待補），而且是已經在本機 minikube 實際部署、重現錯誤、再修復驗證成功的，不是只停留在概念層面。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）、`ServiceAccounts`／RBAC（Day 32）五塊，其餘 CRD/Operators、`Admission Control`、`SecurityContexts` 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。

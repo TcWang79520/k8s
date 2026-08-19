@@ -1,0 +1,60 @@
+# 補上 Role + RoleBinding，讓 gorilla namespace 的 default ServiceAccount
+# 有權限 list serviceaccounts，解決 honeybee-deployment Pod 日誌裡的 Forbidden 錯誤。
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: honeybee-sa-lister
+#   namespace: gorilla
+# rules:
+# - apiGroups: [""]
+#   resources: ["serviceaccounts"]
+#   verbs: ["list"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: honeybee-sa-lister-binding
+#   namespace: gorilla
+# subjects:
+# - kind: ServiceAccount
+#   name: default
+#   namespace: gorilla
+# roleRef:
+#   kind: Role
+#   name: honeybee-sa-lister
+#   apiGroup: rbac.authorization.k8s.io
+---
+# 練習：多加一個 gorilla-role，開放 pods / serviceaccounts / deployments 的 get、list，
+# 綁定給一個新建的 ServiceAccount：gorilla-sa（不是 default，SA 要自己先建立，不會自動產生）
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gorilla-sa
+  namespace: gorilla
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gorilla-role
+  namespace: gorilla
+rules:
+- apiGroups: [""]                    # pods、serviceaccounts 都屬於 core API group
+  resources: ["pods", "serviceaccounts"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]                 # deployments 屬於 apps API group，要分開一條規則
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gorilla-role-binding
+  namespace: gorilla
+subjects:
+- kind: ServiceAccount
+  name: gorilla-sa
+  namespace: gorilla
+roleRef:
+  kind: Role
+  name: gorilla-role
+  apiGroup: rbac.authorization.k8s.io

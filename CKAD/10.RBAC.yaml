@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: honeybee
+  name: honeybee-deployment
+  namespace: gorilla
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: honeybee
+  template:
+    metadata:
+      labels:
+        app: honeybee
+    spec:
+      containers:
+      - command:
+        - sh
+        - -c
+        - |
+          while true ; do
+            date --rfc-3339=seconds
+            kubectl get serviceaccounts
+            sleep 10
+          done
+        image: bitnami/kubectl:latest
+        imagePullPolicy: IfNotPresent
+        name: kubectl
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: gorilla-sa  # 舊版欄位名（已棄用，但相容保留）
+      serviceAccountName: gorilla-sa  # 現行正式欄位，真正生效的是這個

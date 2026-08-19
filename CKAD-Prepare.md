@@ -10,6 +10,8 @@
 - [題目5 - 修正 Deployment 的記憶體 requests/limits（依 namespace LimitRange）](#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange)
 - [題目7 - 金絲雀部署（Canary Deployment）](#題目7---金絲雀部署canary-deployment)
 - [題目8 - 修改 Deployment 的 SecurityContext（runAsUser / allowPrivilegeEscalation）](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation)
+- [題目9 - 建立 Deployment 並指定環境變數](#題目9---建立-deployment-並指定環境變數)
+- [題目10 - RBAC 授權除錯（ServiceAccount 權限不足）](#題目10---rbac-授權除錯serviceaccount-權限不足)
 
 ## 公用知識
 
@@ -17,6 +19,19 @@
 - `kubectl config use-context k8s`：切換到指定 context（範例用 `k8s`）
 - `kubectl config set-context k8s --namespace=pod-resource`
 - （未來陸續補充的通用指令都放這裡）
+
+### `containerPort` vs Service 的 `port` / `targetPort`
+
+同一個字「port」在不同層級代表不同東西，是 Service 相關題目最容易搞混的地方（完整圖解見 [Record.md Day 13](Record.md#day-13)）：
+
+| 欄位 | 在哪裡宣告 | 意義 |
+| --- | --- | --- |
+| `containerPort` | Deployment/Pod 的 `containers[].ports` | 宣告 container **實際監聽**哪個 port，比較偏文件用途；不寫也不影響流量能不能打進去 |
+| `Service.spec.ports[].port` | Service | Client 連這個 Service 要打的 port |
+| `Service.spec.ports[].targetPort` | Service | Service 收到流量後**實際轉發到 Pod 的哪個 port**——這個才要對到 container 真正監聽的 port，沒寫預設等於 `port` |
+
+- `port` 跟 `targetPort` 可以不同（例如對外 `port: 80`、實際轉給 Pod 的 `targetPort: 8080`）
+- 只宣告 `containerPort`、沒建 Service 的題目（例如 [題目9](#題目9---建立-deployment-並指定環境變數)），單純就是文件宣告，不用多想要不要建 Service
 
 ## 題目1 - CronJob 手動觸發 Job
 
@@ -367,3 +382,243 @@ kubectl apply -f 8.yaml
 - container 名稱一定要先查清楚再改（`kubectl get deployment ... -o yaml` 或 `kubectl describe deployment`），`kubectl patch` 用 JSON path 時如果寫錯 index（例如題目其實有多個 container，只改對了 `containers/0` 但目標其實是 `containers/1`）就會改錯 container，白做工
 - 修改完 Deployment 的 Pod template 會觸發 rolling update，記得用 `kubectl rollout status deployment/broker-deployment -n quetzal` 確認新 Pod 有成功套用設定並且 `Running`，也可以 `kubectl get pod <new-pod> -n quetzal -o yaml | grep -A3 securityContext` 直接驗證欄位有沒有進去
 - `allowPrivilegeEscalation: false` 這個欄位在 YAML 裡的布林值就是小寫 `false`，不要打成字串 `"false"`（字串會被當成 truthy 值，等於沒設定成功）
+
+## 題目9 - 建立 Deployment 並指定環境變數
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`ckad00014`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要新建一個用於運行 NGINX 的 Deployment。
+
+**Task**：在現有的 namespace `ckad00014` 中建立一個運行 **6 個 Pod 副本**、名為 `api` 的 Deployment。使用 `nginx:1.16` 映像檔指定一個容器，將名為 `NGINX_PORT`、值為 `8000` 的環境變數加到容器中，然後公開 port `80`。
+
+**相關資源**：[CKAD/09-deployment-env.yaml](CKAD/09-deployment-env.yaml)
+
+**解法指令**：
+
+```bash
+kubectl apply -f CKAD/09-deployment-env.yaml
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: ckad00014
+  labels:
+    app: nginx
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.16
+        env:
+        - name: NGINX_PORT
+          value: "8000"
+        ports:
+        - containerPort: 80
+```
+
+**對應考綱 Domain**：
+
+`Application Design and Build`（20%）→ `Choose and use the right workload resource`（建立 Deployment 本身）、`Application Environment, Configuration and Security`（25%）→ ConfigMap／環境變數相關（這題直接在 `env` 寫死值，是最基本的環境變數設定方式，跟 [Record.md Day 18](Record.md#day-18) 用 `ConfigMap` 掛環境變數是不同做法：這題沒要求要用 ConfigMap，就用最簡單的 inline `env` 即可，不用過度設計）
+
+**易錯點／踩坑筆記**：
+
+- 這份練習 yaml 原本是抄 Kubernetes 官方文件那份經典的 `nginx-deployment` 範例（`name: nginx-deployment`、沒有 `namespace`、`replicas: 3`、`image: nginx:1.14.2`、沒有 `env`），直接套用會整個對不上題目要求——套用任何範本前，一定要逐一比對題目給的每個具體數值（Deployment 名稱、namespace、replica 數、image 版本），不能因為「長得像」就直接交卷
+- 環境變數的 `value` 欄位型別是**字串**，YAML 裡數字不加引號也會被解析成整數，跟 k8s API 要求的 `string` 型別衝突，保險起見這裡寫成 `value: "8000"`（加雙引號）；用 `kubectl set env` 指令則不用擔心這個問題，指令本身會處理成字串
+- 題目說「公開端口 80」指的是**容器要監聽/宣告 port 80**（`containerPort: 80`），不是要另外建立 Service——這題沒有提到 Service，不要多做，只要 Deployment 的 `ports` 欄位寫對即可
+- `NGINX_PORT=8000` 這個環境變數本身**不會**讓 nginx 真的改成監聽 8000 port（nginx 預設監聽 80，要改監聽 port 需要修改 nginx 設定檔或搭配自訂 image/entrypoint 讀取這個環境變數）——這題純粹是「幫容器加一個環境變數」的操作題，跟「nginx 服務實際監聽在哪個 port」是兩回事，題目要求的 `containerPort: 80` 才是實際對外聲明的 port
+- 也可以用指令式寫法一次生成 skeleton 再補環境變數，速度更快：
+  ```bash
+  kubectl create deployment api -n ckad00014 --image=nginx:1.16 --replicas=6 --port=80 --dry-run=client -o yaml > 09-deployment-env.yaml
+  # 再手動編輯加入 env，或用 kubectl set env 補上：
+  kubectl set env deployment/api -n ckad00014 NGINX_PORT=8000
+  ```
+
+## 題目10 - RBAC 授權除錯（ServiceAccount 權限不足）
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`gorilla`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+>
+> 備註（原題）：debug 錯誤，邏輯稍微有點繞。
+
+名為 `honeybee-deployment` 的 Deployment（namespace `gorilla`）裡的 Pod 正在記錄錯誤。
+
+1. 查看日誌以識別錯誤訊息，會看到類似：
+   ```
+   User "system:serviceaccount:gorilla:default" cannot list resource "serviceaccounts" [...] in the namespace "gorilla"
+   ```
+2. 更新 `honeybee-deployment`（廣義上，讓這個 Deployment 底下的 Pod 不再噴這個錯），解決 Pod 日誌中的錯誤。
+
+`honeybee-deployment` 的清單檔案可在 `/ckad/prompt-escargot/honeybee-deployment.yaml` 找到。
+
+> 💡 **這題真正要練的核心技能**：不是死背 `Role`/`RoleBinding` 的 yaml 語法，而是學會**用 kubectl 檢查現有的 `ServiceAccount`／`Role`／`RoleBinding`**，搞清楚「目前哪些 SA 已經有哪些權限」，然後判斷「該把這個 Deployment 設定成用哪個 SA 才對」——修 RBAC 問題常常不是從零生一個 Role，而是先看清楚 cluster 上已經有什麼。
+
+**相關資源**：
+
+- [CKAD/ckad/honeybee-deployment.yaml](CKAD/ckad/honeybee-deployment.yaml)：**修改前**，`serviceAccountName: default`，`default` SA 沒有任何權限，Pod 日誌會持續噴 `Forbidden`
+- [CKAD/10.RBAC.yaml](CKAD/10.RBAC.yaml)：**修改後**，`serviceAccountName: gorilla-sa`，`gorilla-sa` 已經透過 `gorilla-role` 取得 `get`/`list` 權限，套用後 Pod 可以順利執行 `kubectl get serviceaccounts` 不再報錯
+- [CKAD/10-rbac-fix.yaml](CKAD/10-rbac-fix.yaml)：`gorilla-sa`（ServiceAccount）+ `gorilla-role`（Role：`pods`/`serviceaccounts`/`deployments` 的 `get`/`list`）+ `gorilla-role-binding`（RoleBinding，把兩者綁在一起）
+
+`CKAD/ckad/honeybee-deployment.yaml` 的 container 在做什麼：
+
+```yaml
+command:
+- sh
+- -c
+- |
+  while true ; do
+    date --rfc-3339=seconds
+    kubectl get serviceaccounts
+    sleep 10
+  done
+image: bitnami/kubectl:latest   # 原檔是 1.21，該 tag 已從 Docker Hub 下架，見下方踩坑筆記
+```
+
+`bitnami/kubectl` 這個 image 只打包了 `kubectl` CLI。container 起來後每 10 秒印一次時間戳記，然後執行 `kubectl get serviceaccounts`——沒帶 `-n`、也沒帶 `--kubeconfig`，`kubectl` 會自動偵測掛載在 `/var/run/secrets/kubernetes.io/serviceaccount/` 的 in-cluster config（token、CA 憑證、namespace 檔案），用 Pod 自己的 `serviceAccountName: default` 身份、Pod 自己所在的 `gorilla` namespace 去打 API server，因此才會出現錯誤訊息裡的 `system:serviceaccount:gorilla:default`。
+
+**解法指令**（已在本機 minikube 實測跑過整個流程）：
+
+```bash
+kubectl config use-context k8s
+
+# 1. 部署原始的 honeybee-deployment（修改前），重現錯誤
+kubectl apply -f CKAD/ckad/honeybee-deployment.yaml
+
+# 2. 查日誌，確認錯誤訊息
+kubectl logs -n gorilla deploy/honeybee-deployment
+# Error from server (Forbidden): serviceaccounts is forbidden:
+# User "system:serviceaccount:gorilla:default" cannot list resource "serviceaccounts"
+# in API group "" in the namespace "gorilla"
+```
+
+**第一步：用 `kubectl` 檢查現有的 SA / Role / RoleBinding，而不是急著憑空生一個新的**——這才是這題真正要練的解題方法：
+
+```bash
+# 這個 namespace 目前有哪些 ServiceAccount？
+kubectl get sa -n gorilla
+# NAME         SECRETS   AGE
+# default      0         1h
+# gorilla-sa   0         1h        ← 除了 default，還有沒有其他已經建好、看起來就是為這個任務準備的 SA？
+
+# 這個 namespace 目前有哪些 Role／RoleBinding？
+kubectl get role,rolebinding -n gorilla
+
+# 針對看起來相關的 RoleBinding，查它綁定了誰（subjects）、綁的是哪個 Role（roleRef）
+kubectl describe rolebinding gorilla-role-binding -n gorilla
+# Role:  gorilla-role
+# Subjects:
+#   Kind            Name        Namespace
+#   ServiceAccount  gorilla-sa  gorilla
+
+# 再查那個 Role 實際開放了哪些權限
+kubectl describe role gorilla-role -n gorilla
+# PolicyRule:
+#   Resources        Verbs
+#   ---------        -----
+#   pods             [get list]
+#   serviceaccounts  [get list]
+#   deployments.apps [get list]
+```
+
+看到這裡就能判斷出：`gorilla-sa` 已經透過 `gorilla-role` 具備 `serviceaccounts` 的 `get`/`list` 權限——**答案就是把 `honeybee-deployment` 改成用 `gorilla-sa`**，不用另外從零生一個 Role。
+
+**第二步：把 Deployment 改成用 `gorilla-sa`**，兩種等價做法：
+
+```bash
+# 做法 A：指令式，不用碰 yaml
+kubectl set serviceaccount deployment honeybee-deployment gorilla-sa -n gorilla
+
+# 做法 B：直接改 yaml 再 apply（見 CKAD/10.RBAC.yaml，修改前後對照見下方）
+kubectl apply -f CKAD/10.RBAC.yaml
+```
+
+```yaml
+# CKAD/10.RBAC.yaml 跟 CKAD/ckad/honeybee-deployment.yaml 唯一的差異
+      serviceAccount: gorilla-sa       # 修改前是 default
+      serviceAccountName: gorilla-sa   # 修改前是 default（真正生效的欄位）
+```
+
+**驗證**：
+
+```bash
+kubectl logs -n gorilla deploy/honeybee-deployment --tail=6
+# 應該會看到 kubectl get serviceaccounts 成功列出：
+# NAME         AGE
+# default      xxxm
+# gorilla-sa   xxxm
+```
+
+補 RBAC 權限本身用的 [`CKAD/10-rbac-fix.yaml`](CKAD/10-rbac-fix.yaml)（`gorilla-sa` + `gorilla-role` + `gorilla-role-binding`）：
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gorilla-sa
+  namespace: gorilla
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gorilla-role
+  namespace: gorilla
+rules:
+- apiGroups: [""]                    # pods、serviceaccounts 都屬於 core API group
+  resources: ["pods", "serviceaccounts"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]                 # deployments 屬於 apps API group，要分開一條規則
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gorilla-role-binding
+  namespace: gorilla
+subjects:
+- kind: ServiceAccount
+  name: gorilla-sa
+  namespace: gorilla
+roleRef:
+  kind: Role
+  name: gorilla-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**對應考綱 Domain**：
+
+`Application Environment, Configuration and Security`（25%）→ `Authentication / Authorization / Admission Control`、`ServiceAccounts`（這是筆記系列裡第一次涉及這兩個知識點，`Record.md` CKAD TEST 章節目前都標註「尚未涉及」）
+
+**易錯點／踩坑筆記**：
+
+- **看懂錯誤訊息的結構是這題的第一關**：`User "system:serviceaccount:<namespace>:<sa-name>" cannot list resource "<resource>" in API group "<group>" in the namespace "<ns>"` 這句話已經把「誰」（哪個 namespace 的哪個 ServiceAccount）、「想做什麼」（`list`）、「對什麼資源」（`serviceaccounts`）都講清楚了，不用另外猜——直接照著這句話反推需要的 `Role` 規則即可
+- Pod 預設會用該 namespace 的 `default` ServiceAccount（除非 `spec.serviceAccountName` 有另外指定），這題錯誤訊息裡的 `gorilla:default` 就是「`gorilla` namespace 底下的 `default` ServiceAccount」，不是某種特殊帳號名稱叫 `default`
+- **`Role` 是「定義能做什麼」，`RoleBinding` 是「定義誰可以做」**——這是 RBAC 最基本的兩層設計，兩個都要建、缺一個都不會生效：只建 `Role` 沒有 `RoleBinding` 綁定，等於權限規則寫好了但沒人拿得到；只建 `RoleBinding` 沒有對應 `Role`，會直接 apply 失敗（`roleRef` 找不到）
+- `Role`/`RoleBinding` 是 **namespace-scoped** 的資源，只在同一個 namespace 內生效；如果錯誤訊息裡的資源是 cluster-scoped（例如 `nodes`、`persistentvolumes`）或需要跨 namespace 存取，就要改用 `ClusterRole` + `ClusterRoleBinding`，這題的 `serviceaccounts` 是 namespace-scoped 資源，`Role`/`RoleBinding` 就夠了
+- **`bitnami/kubectl:1.21` 這個 tag 在本機練習時抓不到**（`kubectl describe pod` 看到 `Failed to pull image ... manifest unknown`）：Bitnami 在 2025 年中重整了 Docker Hub 上的 image 目錄，舊版本號 tag 大量下架，`bitnami/` 這個免費 namespace 現在通常只留最新版。本機練習改用 `bitnami/kubectl:latest` 即可正常拉取；這是本機/practice cluster 的 registry 連線問題，跟考題邏輯無關，**實際考場的沙盒環境通常有自己的 image cache 或內部 registry，不一定會遇到這個坑**，但如果考試當下真的卡在 `ImagePullBackOff`，`kubectl describe pod` 看 `manifest unknown`／`not found` 這類訊息是第一時間該做的診斷
+- 「更新 Deployment 以解決錯誤」**有兩種同樣合法的修法**，考場上兩種都可能是預期答案：(1) 讓 `default` SA 直接拿到權限（幫 `default` 建 `Role`+`RoleBinding`，Deployment 完全不用動）；(2) 讓 Deployment **改用**另一個「已經有權限」的 SA（`kubectl set serviceaccount` 或直接改 `serviceAccountName`）。這題練習刻意選第二種，是因為更貼近「先查清楚 cluster 上已經準備了什麼」這個實務除錯習慣——**兩種修法都要先確認清楚「現在到底綁的是哪個 SA、那個 SA 有沒有權限」，不要沒查就先動手改**
+- `kubectl set serviceaccount`（別名 `kubectl set sa`）語法是 `kubectl set serviceaccount <resource> <name> <sa-name> -n <namespace>`——第一次打很容易打錯（例如漏打資源類型、資源名稱多打字），指令本身不接受打錯字的資源名稱，`kubectl` 會直接回報 `not found`，這種時候先用 `kubectl get deploy -n <ns>` 確認正確名稱再重打
+- 補完 RBAC 權限、或幫 Deployment 換了 SA 之後，**已經在跑的 Pod 不一定會自動重試成功**：要看應用程式的邏輯是「每次迴圈重新呼叫 API」（這種等下一輪自然就正常了，練習範例的 `while true` 迴圈就是這種）還是「開機時呼叫一次失敗就直接 crash」（這種要 `kubectl rollout restart deployment/honeybee-deployment -n gorilla` 讓它重新啟動、重新嘗試）；不過如果是**改 `serviceAccountName`**（不管用指令或改 yaml），Deployment 的 Pod template 一定會變更，本來就會觸發 rolling update、產生新 Pod，這種情況不用額外下 `rollout restart`
