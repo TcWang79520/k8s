@@ -22,6 +22,7 @@
 - [Day 27](#day-27) - Namespaces 與 ResourceQuota（團隊/專案資源隔離）
 - [Day 31](#day-31) - StatefulSet（原教學系列沒教的元件，補充篇）
 - [Day 32](#day-32) - ServiceAccount 與 RBAC（Role / RoleBinding，補充篇）
+- [Day 33](#day-33) - RollingUpdate 深入：maxSurge / maxUnavailable（補充篇）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -3318,6 +3319,87 @@ kubectl auth can-i list serviceaccounts -n gorilla --as=system:serviceaccount:go
 - `kubectl auth can-i --as=<identity>` 是驗證 RBAC 設定有沒有生效最快的方式，不用真的跑一個 Pod 去試。
 - 這題（[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足)）已在本機 minikube 實際部署 `honeybee-deployment.yaml`、重現 `Forbidden` 錯誤，再套用 `Role`+`RoleBinding` 驗證修復成功（`kubectl get serviceaccounts` 從 403 變成正常回傳清單）。
 
+# Day 33
+
+> 跟 [Day 31](#day-31)/[Day 32](#day-32) 一樣，這篇是原教學系列沒深入教的內容，補的是 [Day 8](#day-8) 只用兩句話帶過的 `strategy.rollingUpdate.maxSurge`／`maxUnavailable`。起因是 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實際在本機 minikube 跑完「設定升級策略 → 更新 image → 回滾」整個流程，過程中發現一個 Day 8 完全沒提到、但實測驗證出來的重要行為——**回滾不會還原升級策略**，藉這個機會把 `RollingUpdate` 的運作機制講清楚。
+
+## 為什麼 Deployment 更新不會直接砍掉所有舊 Pod
+
+[Day 8](#day-8) 提過 Deployment 更新時「不會直接砍掉舊 Pod，而是另外建立新 Pod 取代舊 Pod」，這件事背後其實有兩種策略可以選，寫在 `spec.strategy.type`：
+
+- **`Recreate`**：先把**所有**舊 Pod 全部刪除，再建立所有新 Pod。簡單粗暴，但更新過程中會有一段時間**完全沒有 Pod 在運作**，服務會中斷。
+- **`RollingUpdate`**（**預設值**，沒特別寫 `type` 就是這個）：新舊 Pod **交錯**汰換，更新過程中「舊 Pod 逐漸減少、新 Pod 逐漸增加」，中間有一段時間新舊版本同時存在、服務不中斷——這就是 [Day 8](#day-8) 說的 **zero downtime deployment**。
+
+`RollingUpdate` 這個「交錯汰換」的節奏，就是靠 `maxSurge` 跟 `maxUnavailable` 這兩個欄位精確控制的。
+
+## `maxSurge` 與 `maxUnavailable` 到底在控制什麼
+
+以 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實際練習的設定為例：`replicas: 4`、`maxSurge: 10%`、`maxUnavailable: 4`。
+
+- **`maxSurge`**：更新過程中，Pod 總數最多可以**比 `replicas` 多出多少**（新 Pod 允許先建起來、不用等舊 Pod 死透）。
+  - 可以寫**絕對數字**（例如 `1`）或**百分比**（例如 `10%`），百分比是相對 `replicas` 計算，**無條件進位（round up）**。
+  - 這題 `replicas: 4`、`maxSurge: 10%` → `4 × 10% = 0.4` → 無條件進位 → **實際上限是 1**，也就是更新中最多同時存在 `4 + 1 = 5` 個 Pod。
+- **`maxUnavailable`**：更新過程中，**最多可以容忍幾個 Pod 不可用**（舊 Pod 可以先被砍、不用等新 Pod 完全 Ready）。
+  - 一樣可以寫絕對數字或百分比，百分比**無條件捨去（round down）**。
+  - 這題直接給絕對數字 `4`，不用計算，代表更新中**最多可以到 0 個 Pod 在服務**（`replicas: 4` 全部不可用），這其實已經很接近 `Recreate` 策略的行為了，只是還多保留了 `maxSurge` 給的 1 個 Pod 當緩衝。
+- **兩者不能同時是 0**：如果 `maxSurge: 0` 又 `maxUnavailable: 0`，代表「不准多、也不准少」，Deployment 會完全卡住沒辦法更新（沒有任何 Pod 數量的操作空間），所以 Kubernetes 規定這兩個欄位**不能同時為 `0`**。
+
+## Rolling Update 實際怎麼跑：時間軸示意
+
+以官方文件經典範例（`replicas: 3`、`maxSurge: 1`、`maxUnavailable: 1`）畫成時間軸，比題目15 的極端值更容易看出「交錯汰換」的節奏：
+
+```
+t0（更新前）        [v1] [v1] [v1]                          共 3 個，全部 v1
+
+t1（先 surge 1 個） [v1] [v1] [v1] [v2]                      共 4 個（3+maxSurge 1），新 Pod 還在 Not Ready
+
+t2（新 Pod Ready，  [v1] [v1]      [v2]                      砍 1 個舊 Pod（maxUnavailable 1），
+    先砍舊的）                                                共 3 個，繼續 surge 下一個
+
+t3                 [v1] [v1]      [v2] [v2]                 共 4 個，繼續交錯
+
+t4                 [v1]           [v2] [v2]                 共 3 個
+
+t5                 [v1]           [v2] [v2] [v2]             共 4 個，最後一輪
+
+t6（完成）                              [v2] [v2] [v2]        共 3 個，全部 v2
+```
+
+整個過程 Pod 總數在 `replicas - maxUnavailable` 到 `replicas + maxSurge` 之間來回浮動（這裡就是 `2` 到 `4` 之間），**服務可用的 Pod 數量從來沒有掉到 0**，這正是 zero downtime 的關鍵。
+
+## 題目15 的實測發現：回滾不會還原升級策略
+
+這是這篇筆記最重要的一個實測結果。[CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 的三個步驟依序是：① 設定 `maxSurge`/`maxUnavailable` → ② `kubectl set image` 更新版本 → ③ `kubectl rollout undo` 回滾。直覺上可能會以為 `rollout undo` 是「整個 Deployment 打包回到上一個狀態」，但實測結果不是：
+
+```bash
+kubectl rollout undo deployment/webapp -n default
+
+kubectl get deploy webapp -n default -o jsonpath='{.spec.template.spec.containers[0].image}'
+# lfccncf/nginx:1.13   ← image 確實回滾了
+
+kubectl get deploy webapp -n default -o jsonpath='{.spec.strategy}'
+# {"rollingUpdate":{"maxSurge":"10%","maxUnavailable":4},"type":"RollingUpdate"}
+# ← strategy 完全沒被還原，還是步驟①設定的值
+```
+
+原因是 **`kubectl rollout undo` 回滾的對象只有 `spec.template`**（也就是 Pod 版本，靠背後的 ReplicaSet 歷史紀錄），`spec.strategy` 是 Deployment 這個物件本身的設定、**不屬於任何一筆版本歷史**，`rollout history` 記錄的是「每次 `spec.template` 變動」，`strategy` 改變並不會產生新的 revision，自然也就不在 `rollout undo` 的回滾範圍內。
+
+這跟 [Day 8](#day-8) 提過的 `kubectl rollout history`／`CHANGE-CAUSE` 觀念是同一件事的另一面：**只有 Pod template 的變動會被記錄成版本、可以回滾；Deployment 上其他「後設」設定（`strategy`、`replicas` 本身的數字等）改了就是改了，沒有版本歷史、也沒有回滾機制**，要復原只能自己手動改回去。
+
+## 我的想法
+
+- `maxSurge`/`maxUnavailable` 這兩個欄位乍看只是兩個數字，但背後其實是在「更新速度」跟「服務餘裕」之間做取捨：`maxSurge` 大 → 更新快，但同時佔用更多資源（要多開新 Pod）；`maxUnavailable` 大 → 更新快，但同時犧牲更多可用性。題目15 給的 `maxUnavailable: 4`（等於 `replicas`）算是把可用性讓到底線的極端例子，練習時特地算過 `maxSurge: 10%` 實際換算成 `1`，親手算一次比死背公式更容易記住「進位/捨去」這個容易忽略的細節。
+- **回滾不會還原 `strategy`** 這件事，本質上跟 [Day 27](#day-27) `ResourceQuota` 那種「namespace 層級設定」與 [Day 21](#day-21) `PersistentVolumeClaim` 那種「單次宣告的資源」的分野有點像：Kubernetes 裡有一部分東西是有「版本歷史」概念的（Deployment 的 `template`、ConfigMap 搭配工具可以做版本控管），也有一部分東西純粹是「當下設定值」，沒有版本、改了就是改了。分辨「這個欄位有沒有版本歷史」，是判斷「能不能用 `rollout undo` 復原」的關鵽。
+- 這也解釋了為什麼考場這種題目喜歡把「改策略」跟「回滾」放在同一題：如果沒有實際動手做過，很容易憑直覺以為回滾是全域的，寫申論題時漏掉「strategy 不會被還原」這個細節，但實作題（像 CKAD 這種）一跑就能親眼看到結果不符預期，這正是「動手做」比「看文件」更容易記住的地方。
+
+## 小結
+
+- `spec.strategy.type` 有 `Recreate`（全砍全建，會停機）跟 `RollingUpdate`（預設值，交錯汰換，zero downtime）兩種，[Day 8](#day-8) 說的「不會直接砍掉舊 Pod」指的就是 `RollingUpdate` 這個預設策略。
+- `maxSurge` 控制「最多可以多幾個 Pod」（新的先上）、`maxUnavailable` 控制「最多可以少幾個 Pod」（舊的先下），兩者都可以用絕對數字或百分比表示，**百分比換算時 `maxSurge` 無條件進位、`maxUnavailable` 無條件捨去**，且兩者不能同時為 `0`。
+- 整個 rolling update 過程中，Pod 總數會在 `replicas - maxUnavailable` 到 `replicas + maxSurge` 之間浮動，可用 Pod 數量不會掉到 0，這就是 zero downtime 的實作原理。
+- **關鍵實測結論：`kubectl rollout undo` 只回滾 `spec.template`（Pod 版本），不會回滾 `spec.strategy`**——這兩者是獨立的東西，`strategy` 沒有版本歷史，回滾後如果要恢復原本的升級策略，得自己手動改回去。
+- 已在 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實際部署驗證：`kubectl patch` 設定策略 → `kubectl set image` 更新 → `kubectl rollout undo` 回滾，最終狀態確認是「新策略 + 舊 image」的組合，不是全部還原。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -3348,7 +3430,7 @@ kubectl auth can-i list serviceaccounts -n gorilla --as=system:serviceaccount:go
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
 | 部署策略（blue/green、canary） | 使用 K8s 原生機制實作部署策略 | 尚未涉及 |
-| Deployment 與 rolling update | 管理 Pod 版本更新 | [Day 8](#day-8)（`kubectl set image`、`rollout status/history/undo`、`maxSurge`、`maxUnavailable`） |
+| Deployment 與 rolling update | 管理 Pod 版本更新 | [Day 8](#day-8)（`kubectl set image`、`rollout status/history/undo`、`maxSurge`、`maxUnavailable`）、[Day 33](#day-33)（`RollingUpdate` vs `Recreate`、`maxSurge`/`maxUnavailable` 進位規則與運作時間軸、實測驗證 `rollout undo` 不會還原 `strategy`） |
 | Helm | 套件管理工具 | 尚未涉及 |
 | Kustomize | 設定檔管理工具 | 尚未涉及 |
 
@@ -3385,7 +3467,7 @@ kubectl auth can-i list serviceaccounts -n gorilla --as=system:serviceaccount:go
 
 ## 小結
 
-- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）、`ServiceAccount` 與 RBAC `Role`/`RoleBinding` 實際部署驗證（Day 32，原教學系列沒教、自行補充）。
+- 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）、`ServiceAccount` 與 RBAC `Role`/`RoleBinding` 實際部署驗證（Day 32，原教學系列沒教、自行補充）、`RollingUpdate` 策略深入（`maxSurge`/`maxUnavailable` 運作機制與進位規則、實測驗證 `rollout undo` 不會還原 `strategy`）（Day 33，原教學系列沒教、自行補充）。
 - Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 13 補充說明**：「搞懂 Service Port / Pod Port / targetPort / nodePort」這節整理的四層 port 對照，是 CKAD 考古題裡多次出現的基礎知識——例如 [CKAD-Prepare.md 題目9](CKAD-Prepare.md#題目9---建立-deployment-並指定環境變數) 就實際碰到「`containerPort` 只是容器監聽 port 的宣告、不等於 Service 會自動轉發過去」這個常見誤解；核心心法是**同一個字「port」在四個不同層級各自代表不同東西**，`targetPort` 才是真正連結 Service 跟 Pod 實際監聽 port 的欄位，`containerPort` 更接近文件用途。
@@ -3398,4 +3480,5 @@ kubectl auth can-i list serviceaccounts -n gorilla --as=system:serviceaccount:go
 - **Day 27 補充說明**：`ResourceQuota` 補上了 [Day 25](#day-25) 留下的 `limits`／配額缺口，把資源管控的層級從「單一 container」拉高到「整個 Namespace」；這次實測也發現一個容易忽略的細節——Kubernetes 會自動在每個 namespace 產生 `kube-root-ca.crt` 這個 ConfigMap，設定 `configmaps` 這類物件配額時要把這些自動產生的物件也算進去，不然配額可能一建立就被用光。`Namespaces` 本身雖然不是獨立的 CKAD 考綱條目，但幾乎是 `Requests/limits/quotas`、`ServiceAccounts`、`NetworkPolicies`（依 namespace 隔離網路流量）這幾個考點共同的基礎概念。
 - **Day 31 補充說明**：`StatefulSet` 是這系列筆記原文完全沒教、自行補充的內容，補上的是 `Choose and use the right workload resource` 這個知識點裡「多 replica 的 stateful 應用」這一塊；只整理概念與 yaml 範例，沒有像 [Day 22](#day-22)/[Day 25](#day-25)/[Day 27](#day-27) 那樣實際部署驗證，`DaemonSet`／`CronJob` 這兩個同一知識點下的其他 workload 類型也還沒涉及。
 - **Day 32 補充說明**：`ServiceAccount` 與 RBAC（`Role`/`RoleBinding`）是這系列筆記原文完全沒教、因準備 CKAD 考古題（[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足)）實際踩到 `Forbidden` 錯誤才回頭補充的內容，一次補齊 `ServiceAccounts` 跟 `Authentication / Authorization / Admission Control` 兩個知識點裡的 Authentication／Authorization 部分（`Admission Control` 仍待補），而且是已經在本機 minikube 實際部署、重現錯誤、再修復驗證成功的，不是只停留在概念層面。
+- **Day 33 補充說明**：`RollingUpdate` 的 `maxSurge`/`maxUnavailable` 運作機制是 [Day 8](#day-8) 只用兩句話帶過、沒深入解釋的部分，因準備 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實測「設定策略 → 更新 → 回滾」整個流程時，親手發現 `kubectl rollout undo` 只回滾 `spec.template`、完全不會還原 `spec.strategy` 這個 Day 8 沒提過的細節，才回頭把百分比進位規則、Pod 數量浮動時間軸一起整理清楚；屬於 `Deployment 與 rolling update` 這個既有知識點的深化，不是新知識點。
 - 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）、`ServiceAccounts`／RBAC（Day 32）五塊，其餘 CRD/Operators、`Admission Control`、`SecurityContexts` 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。

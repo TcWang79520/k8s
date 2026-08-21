@@ -16,6 +16,7 @@
 - [題目12 - 建立 Secret 並以環境變數使用](#題目12---建立-secret-並以環境變數使用)
 - [題目13 - Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)
 - [題目14 - 幫既有 Deployment 加上 ReadinessProbe](#題目14---幫既有-deployment-加上-readinessprobe)
+- [題目15 - Deployment 升級策略、更新與回滾](#題目15---deployment-升級策略更新與回滾)
 
 ## 公用知識
 
@@ -24,6 +25,25 @@
 - `kubectl config set-context k8s --namespace=pod-resource`
 - `kubectl get pods -A`：撈出**所有 namespace** 的 Pod（`-A`/`--all-namespaces`），題目沒指定或說「可能在任何 namespace」時的第一步（見 [題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)）；同樣的 `-A` 也能加在 `get events`/`get deploy` 等其他資源上，不是 `get pods` 專屬
 - （未來陸續補充的通用指令都放這裡）
+
+### 修改既有物件：優先用「匯出 → 編輯 → apply」，少用 `kubectl edit`
+
+`kubectl edit` 預設開啟的編輯器常常是最原始難用的 `vi`（不熟的話光是「怎麼存檔離開」就會卡住浪費時間），建議固定用這個模式取代：
+
+```bash
+# 1. 匯出 YAML
+kubectl get deployment <name> -o yaml > deploy.yaml
+
+# 2. 用習慣的編輯器修改
+nano deploy.yaml   # 或 vim/其他熟悉的編輯器
+
+# 3. 套用變更
+kubectl apply -f deploy.yaml
+```
+
+- 好處不只是「換個熟悉的編輯器」：整個過程有實體檔案留底，改錯了可以直接對照、重編輯再 apply 一次，不用像 `kubectl edit` 那樣在編輯器裡卡住、或改壞了要重新整個流程來過
+- 這個模式在 [題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation) 就已經用過（當時定位是「沒有編輯器可用時的備案」），現在直接**升級成優先做法**，不用等到 `kubectl edit` 真的打不開才想到；[題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod) 修 Pod 的 liveness probe、[題目14](#題目14---幫既有-deployment-加上-readinessprobe)/[題目15](#題目15---deployment-升級策略更新與回滾) 修 Deployment 也都是同一套「匯出→編輯→套用」的節奏，只是分別用 `apply`（Deployment，可覆蓋更新）跟「`delete` 再 `apply`」（單獨的 Pod，container 欄位不可變，見題目13）
+- 考場如果連 `nano`/`vim` 都不熟，`sed -i` 這種指令式取代也是選項（[題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod) 用過），但只適合「明確知道要改哪一行、不會誤改到其他相同字串」的簡單情況，欄位複雜或有重複字串時還是手動編輯比較保險
 
 ### `containerPort` vs Service 的 `port` / `targetPort`
 
@@ -1022,3 +1042,88 @@ kubectl get pods -n default -l app=probe-http
 - 這題是**修改既有 Deployment**（不是新建），跟 [題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation)、[題目5](#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange) 是同一種題型套路——考場常見的「改一個已經在跑的物件」類型，重點永遠是先查清楚現況（`kubectl get deploy ... -o yaml`）、確認 container 名稱/index，再用 `edit`／`patch`／「匯出改完 apply」三選一動手，不要自己重寫一份新 yaml 整個 `apply` 蓋過去（容易漏掉原本就有的欄位，例如 `resources`、`env`）
 - `kubectl set` 底下**沒有** `probe` 這個子指令（跟 `kubectl set env`/`kubectl set resources`/`kubectl set serviceaccount` 不同），沒有「一行指令幫 Deployment 加探測器」這種捷徑，只能透過 `edit`/`patch`/改 yaml 這幾種方式，考試時別浪費時間找不存在的指令
 - 練習素材一開始用 `nginx:stable` 當 image，但 `nginx:stable` 沒有 `/healthz/return200` 這個路徑，探測會一直失敗、`READY` 卡在 `0/1`——只能驗證「yaml 欄位寫對」，驗證不了「Pod 真的變 `Ready`」；換成 `vicuu/helloweb:v1`（真的有實作這個路徑）之後，`READY` 才會變成 `1/1`。這也是一個提醒：**readinessProbe 探測會不會過，跟 yaml 語法對不對是兩回事**，yaml 寫得再標準，應用程式本身沒有那個 endpoint 一樣過不了，考試時如果 Pod 遲遲不 Ready，先確認題目給的路徑跟 image 是不是真的匹配，別只顧著檢查 yaml 縮排
+
+## 題目15 - Deployment 升級策略、更新與回滾
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`default`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要更新一個應用程式，然後執行該更新的回滾。
+
+**Task**：
+
+1. 更新 namespace `default` 中的 Deployment `webapp` 的比例縮放配置，將 `maxSurge` 設為 `10%`，將 `maxUnavailable` 設為 `4`。
+2. 更新 Deployment `webapp`，讓容器映像檔改用 `lfccncf/nginx` 的 `1.13.7` 版本標籤。
+3. 將 Deployment `webapp` 回滾至前一版本。
+
+**相關資源**：[CKAD/15-webapp-existing.yaml](CKAD/15-webapp-existing.yaml)（自建的練習用「既有」Deployment，初始 image 是 `lfccncf/nginx:1.13`）
+
+**解法指令**（已在本機 minikube 完整實測三個步驟，包含驗證回滾後真的還原）：
+
+```bash
+kubectl config use-context k8s
+
+# 部署練習用的「既有」Deployment
+kubectl apply -f CKAD/15-webapp-existing.yaml
+kubectl rollout status deployment/webapp -n default
+
+# 1. 設定 maxSurge/maxUnavailable
+kubectl patch deployment webapp -n default --type='json' -p='[
+  {"op": "replace", "path": "/spec/strategy", "value": {
+    "type": "RollingUpdate",
+    "rollingUpdate": {"maxSurge": "10%", "maxUnavailable": 4}
+  }}
+]'
+
+# 2. 更新 image 版本（container 名稱是 nginx，依實際 yaml 調整）
+kubectl set image deployment/webapp nginx=lfccncf/nginx:1.13.7 -n default
+kubectl rollout status deployment/webapp -n default
+
+# 3. 回滾到前一版本
+kubectl rollout undo deployment/webapp -n default
+kubectl rollout status deployment/webapp -n default
+```
+
+`kubectl patch` 那段等價的 yaml 寫法（`kubectl edit`／匯出改 apply 都可以）：
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 10%
+      maxUnavailable: 4
+```
+
+**驗證**：
+
+```bash
+# 確認策略設定正確
+kubectl get deploy webapp -n default -o jsonpath='{.spec.strategy}'
+# {"rollingUpdate":{"maxSurge":"10%","maxUnavailable":4},"type":"RollingUpdate"}
+
+# 確認回滾後 image 真的變回舊版本（不是還停在 1.13.7）
+kubectl get deploy webapp -n default -o jsonpath='{.spec.template.spec.containers[0].image}'
+# lfccncf/nginx:1.13
+
+# 查看 rollout 歷史，確認多了一筆紀錄
+kubectl rollout history deployment webapp -n default
+```
+
+**對應考綱 Domain**：
+
+`Application Deployment`（20%）→ `Deployment 與 rolling update`（延續 [Record.md Day 8](Record.md#day-8) 學過的 `kubectl set image`、`rollout status/history/undo`、`maxSurge`/`maxUnavailable`，這題是把 Day 8 三個核心操作一次串起來考的整合題型）
+
+**易錯點／踩坑筆記**：
+
+- `maxSurge` 跟 `maxUnavailable` 都定義在 `spec.strategy.rollingUpdate` 底下，**不是** `spec.template` 裡的東西，改的時候不要跟 container 層級的設定搞混；這題 `maxSurge` 給的是百分比字串 `"10%"`，`maxUnavailable` 給的是純數字 `4`，**兩個欄位的型別是 `IntOrString`，可以混用數字跟百分比**，不用兩個都用同一種格式
+- **`kubectl rollout undo` 只會回滾 `spec.template`（Pod 版本），不會動到 `spec.strategy`**：這題實測過，回滾後 `image` 確實變回 `lfccncf/nginx:1.13`，但 `maxSurge`/`maxUnavailable` 的設定完全沒被還原、依然是 `10%`/`4`——因為 `strategy` 是 Deployment 層級的設定，不屬於 ReplicaSet 版本歷史的一部分，`rollout undo` 只回滾「哪個 ReplicaSet 該是目前的版本」，題目要求的三個步驟做完，最終狀態應該是「新的 strategy + 舊的 image」，不是全部都變回最初的樣子，這是這題容易誤解的地方
+- 實測 `kubectl rollout undo` 時會出現一個警告：`Warning: resource deployments/webapp was previously managed with 'kubectl apply'. Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation, which may cause unexpected behavior on future 'kubectl apply' operations.`——這是**正常的警告，不是錯誤**，代表回滾後如果之後又用 `kubectl apply -f 原本的yaml檔` 會蓋回 apply 檔案裡寫的版本（把回滾的結果又蓋掉），這題只要求「回滾」這個動作本身完成即可，不用理會這個警告，但要知道它在講什麼、之後不要不小心又 `apply` 舊檔案蓋掉回滾結果
+- 沒有用 `--record` 或 `--record=true` 執行 `kubectl set image`，`kubectl rollout history` 的 `CHANGE-CAUSE` 欄位會是空的（`<none>`）——這題沒有要求要看 `CHANGE-CAUSE`，不影響解題，但如果考題要求「查看每次更新的原因」，記得更新指令要加 `--record`（雖然這個 flag 在新版 kubectl 已標示為 deprecated，但目前仍可用）
+- 這題本質上是 [Record.md Day 8](Record.md#day-8) 三個指令的排列組合：`maxSurge`/`maxUnavailable` 設定 → `kubectl set image` 更新 → `kubectl rollout undo` 回滾，考試時不要漏掉任何一步，尤其是**順序**：要先更新（產生新版本），才有版本可以回滾，題目的步驟順序就是正確的操作順序，照著做即可

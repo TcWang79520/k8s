@@ -1,0 +1,25 @@
+# 模擬考場既有的 Deployment webapp（練習用初始版本，image 先用舊版本 1.13.6）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: default
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: webapp
+  strategy:
+    rollingUpdate:
+      maxSurge: 10%
+      maxUnavailable: 4
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      containers:
+      - name: nginx
+        image: lfccncf/nginx:1.13.7
+        ports:
+        - containerPort: 80
