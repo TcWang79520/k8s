@@ -1,0 +1,38 @@
+# 模擬考場既有狀態：namespace qa 已存在，底下已經有幾個 ServiceAccount
+# - frontend-sa：正在被 frontend 這個 Pod 使用（清理時不能刪）
+# - old-token-sa：沒有任何 Pod 在用（清理時要刪掉）
+# 注意：backend-sa 這題故意不在這裡先建，練習「自己建立」這個步驟
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qa
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend-sa
+  namespace: qa
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: old-token-sa
+  namespace: qa
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: frontend
+  namespace: qa
+spec:
+  serviceAccountName: frontend-sa
+  containers:
+  - name: nginx
+    image: nginx:stable
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-sa
+  namespace: qa
+automountServiceAccountToken: false

@@ -17,6 +17,7 @@
 - [題目13 - Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)
 - [題目14 - 幫既有 Deployment 加上 ReadinessProbe](#題目14---幫既有-deployment-加上-readinessprobe)
 - [題目15 - Deployment 升級策略、更新與回滾](#題目15---deployment-升級策略更新與回滾)
+- [題目16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA](#題目16---serviceaccount-命名規則禁止自動掛載-token清理未使用的-sa)
 
 ## 公用知識
 
@@ -1127,3 +1128,95 @@ kubectl rollout history deployment webapp -n default
 - 實測 `kubectl rollout undo` 時會出現一個警告：`Warning: resource deployments/webapp was previously managed with 'kubectl apply'. Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation, which may cause unexpected behavior on future 'kubectl apply' operations.`——這是**正常的警告，不是錯誤**，代表回滾後如果之後又用 `kubectl apply -f 原本的yaml檔` 會蓋回 apply 檔案裡寫的版本（把回滾的結果又蓋掉），這題只要求「回滾」這個動作本身完成即可，不用理會這個警告，但要知道它在講什麼、之後不要不小心又 `apply` 舊檔案蓋掉回滾結果
 - 沒有用 `--record` 或 `--record=true` 執行 `kubectl set image`，`kubectl rollout history` 的 `CHANGE-CAUSE` 欄位會是空的（`<none>`）——這題沒有要求要看 `CHANGE-CAUSE`，不影響解題，但如果考題要求「查看每次更新的原因」，記得更新指令要加 `--record`（雖然這個 flag 在新版 kubectl 已標示為 deprecated，但目前仍可用）
 - 這題本質上是 [Record.md Day 8](Record.md#day-8) 三個指令的排列組合：`maxSurge`/`maxUnavailable` 設定 → `kubectl set image` 更新 → `kubectl rollout undo` 回滾，考試時不要漏掉任何一步，尤其是**順序**：要先更新（產生新版本），才有版本可以回滾，題目的步驟順序就是正確的操作順序，照著做即可
+
+## 題目16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA
+
+**Quick Reference**：
+
+- Namespace：`qa`
+
+**題目敘述**：
+
+**情境（Context）**：組織的安全策略要求：
+
+- ServiceAccount **不得自動掛載 API 憑據**
+- ServiceAccount **名稱必須以 `-sa` 結尾**
+
+清單檔案 `/cks/sa/pod1.yaml` 中指定的 Pod，因為 ServiceAccount 指定錯誤而無法建立。
+
+**Task**：
+
+1. 在現有 namespace `qa` 中建立一個名為 `backend-sa` 的新 ServiceAccount，確保這個 ServiceAccount **不自動掛載 API 憑據**。
+2. 使用 `/cks/sa/pod1.yaml` 中的清單檔案來建立一個 Pod。
+3. 最後，清理 namespace `qa` 中任何**未使用**的 ServiceAccount。
+
+> 題號雖然編在 CKAD 練習序列裡，但題目風格（安全策略、ServiceAccount 治理）比較偏 **CKS**（Certified Kubernetes Security Specialist）的考點；CKAD 官方考綱裡跟這題最相關的還是 `ServiceAccounts` 這個知識點本身，題目多考的「命名規則」「禁止自動掛載」「清理未使用資源」則是更廣義的資安治理概念，CKAD/CKS 兩張證照在 `ServiceAccounts` 這塊知識是共用、互通的。
+
+**相關資源**：[CKAD/16-qa-setup.yaml](CKAD/16-qa-setup.yaml)（自建的練習用「既有」狀態：`qa` namespace + `frontend-sa`（被 `frontend` Pod 使用中）+ `old-token-sa`（沒人用，練習清理用））、[CKAD/16-pod1-broken.yaml](CKAD/16-pod1-broken.yaml)（模擬考場的 `/cks/sa/pod1.yaml`，`serviceAccountName` 一開始故意指定錯誤）
+
+**解法指令**（已在本機 minikube 完整實測三個步驟）：
+
+```bash
+# 部署練習用的既有狀態
+kubectl apply -f CKAD/16-qa-setup.yaml
+
+# 印證題目描述：直接套用「錯誤」的 pod1.yaml 會直接被拒絕，根本建不起來
+kubectl apply -f CKAD/16-pod1-broken.yaml
+# Error from server (Forbidden): pods "pod1" is forbidden:
+# error looking up service account qa/backend: serviceaccount "backend" not found
+
+# 1. 建立 backend-sa，關閉自動掛載 API 憑據
+kubectl create serviceaccount backend-sa -n qa
+kubectl patch serviceaccount backend-sa -n qa -p '{"automountServiceAccountToken": false}'
+
+# 2. 修正 pod1.yaml 的 serviceAccountName，再建立 Pod
+sed -i 's/serviceAccountName: backend/serviceAccountName: backend-sa/' CKAD/16-pod1-broken.yaml
+kubectl apply -f CKAD/16-pod1-broken.yaml
+
+# 3. 找出並清理未使用的 ServiceAccount
+kubectl get sa -n qa
+kubectl get pods -n qa -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.serviceAccountName}{"\n"}{end}'
+# 兩份清單對照，SA 清單裡有、但沒有任何 Pod 在用的，就是要刪的（這裡是 old-token-sa）
+kubectl delete sa old-token-sa -n qa
+```
+
+`kubectl create serviceaccount` 沒有 `--automount` 這種 flag，`automountServiceAccountToken` 只能建立後用 `patch`／`edit`／yaml 補上：
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-sa
+  namespace: qa
+automountServiceAccountToken: false
+```
+
+**驗證**：
+
+```bash
+kubectl get sa backend-sa -n qa -o yaml | grep automount
+# automountServiceAccountToken: false
+
+kubectl get pod pod1 -n qa
+# READY 1/1，Running
+
+# 確認真的沒有 token 被掛進去
+kubectl exec pod1 -n qa -- ls /var/run/secrets/kubernetes.io/serviceaccount/
+# ls: cannot access '/var/run/secrets/kubernetes.io/serviceaccount/': No such file or directory
+
+kubectl get sa -n qa
+# 應該只剩 default／frontend-sa／backend-sa，old-token-sa 已經不見
+```
+
+**對應考綱 Domain**：
+
+`Application Environment, Configuration and Security`（25%）→ `ServiceAccounts`（延續 [Record.md Day 32](Record.md#day-32) 學過的 `ServiceAccount` 基礎，這題深入到 `automountServiceAccountToken` 這個安全性欄位、以及「清理未使用資源」這種治理性任務）
+
+**易錯點／踩坑筆記**：
+
+- **Pod 引用不存在的 ServiceAccount，不是「排程失敗」（`Pending`），而是直接在建立階段被拒絕**：實測 `kubectl apply` 直接回傳 `Error from server (Forbidden): ... serviceaccount "backend" not found`，Pod 物件連建都建不起來，這跟資源不足導致 `Pending` 的排程失敗是完全不同的失敗階段——`ServiceAccount` 存在與否是在 API server 的 admission 階段就檢查，比 scheduler 排程還要早一步
+- `automountServiceAccountToken` 這個欄位**在 `ServiceAccount` 跟 `Pod` 兩個層級都存在**：`ServiceAccount` 層級設 `false` 是「這個身份預設不掛 token」，`Pod.spec.automountServiceAccountToken` 則是**該 Pod 自己的設定，會覆蓋 ServiceAccount 層級的值**——這題只要求 ServiceAccount 層級不自動掛載，題目沒特別要求 Pod 層級也要設，設在 SA 層級對所有用這個 SA 的 Pod 都有效，比每個 Pod 各自設更省事，也更符合「組織安全策略」這種「一次設定、全體套用」的治理精神
+- **`kubectl create serviceaccount` 沒有對應的 flag 可以直接指定 `automountServiceAccountToken`**（不像 `kubectl create secret` 有 `--from-literal`），只能先建立、再用 `kubectl patch`／`kubectl edit`／改 yaml 補上，這跟[題目14](#題目14---幫既有-deployment-加上-readinessprobe)發現「`kubectl set` 沒有 `probe` 子指令」是同一種提醒：不是每個物件、每個欄位都有指令式捷徑，該回 yaml 就回 yaml
+- **判斷「未使用」的方法：拿 `kubectl get sa` 的清單，去對照 `kubectl get pods -o jsonpath='{...spec.serviceAccountName}'` 這種列出「每個 Pod 實際用哪個 SA」的清單**，兩邊一比對，SA 清單裡有、但沒有任何 Pod 引用到的，就是未使用——不要單純看 SA 的 `AGE` 或用猜的，也不要漏掉「有些 Pod 可能沒寫 `serviceAccountName`」這種隱性使用 `default` 的情況（這種 Pod 的 `jsonpath` 輸出會是空字串，不是完全沒有值）
+- **`default` 這個系統自動產生的 ServiceAccount，慣例上不算進「未使用要清理」的範圍**，就算目前沒有 Pod 明確指定用它，也不建議刪除——它是每個 namespace 天生就有的資源（[Record.md Day 32](Record.md#day-32) 提過），清理未使用 SA 這種任務通常針對「使用者自己建立的」SA，不是系統自動管理的物件
+- 這題的**核心精神是「安全治理」而不是「單純的 CRUD」**：`-sa` 命名規則、禁止自動掛載 token、清理未使用資源，三件事合起來是在降低「多餘的 ServiceAccount 帶著能打 API 的憑證到處留著」這種攻擊面——跟 [Record.md Day 32](Record.md#day-32) 討論過的「最小權限原則」（`Role` 只給需要的 `verbs`）是同一種資安思維的不同層面：一個管「能做什麼」，一個管「憑證會不會被不必要地掛出去、留下來」
