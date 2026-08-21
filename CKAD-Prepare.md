@@ -18,6 +18,7 @@
 - [題目14 - 幫既有 Deployment 加上 ReadinessProbe](#題目14---幫既有-deployment-加上-readinessprobe)
 - [題目15 - Deployment 升級策略、更新與回滾](#題目15---deployment-升級策略更新與回滾)
 - [題目16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA](#題目16---serviceaccount-命名規則禁止自動掛載-token清理未使用的-sa)
+- [題目17 - 更新 Deployment 並暴露 Service](#題目17---更新-deployment-並暴露-service)
 
 ## 公用知識
 
@@ -1220,3 +1221,121 @@ kubectl get sa -n qa
 - **判斷「未使用」的方法：拿 `kubectl get sa` 的清單，去對照 `kubectl get pods -o jsonpath='{...spec.serviceAccountName}'` 這種列出「每個 Pod 實際用哪個 SA」的清單**，兩邊一比對，SA 清單裡有、但沒有任何 Pod 引用到的，就是未使用——不要單純看 SA 的 `AGE` 或用猜的，也不要漏掉「有些 Pod 可能沒寫 `serviceAccountName`」這種隱性使用 `default` 的情況（這種 Pod 的 `jsonpath` 輸出會是空字串，不是完全沒有值）
 - **`default` 這個系統自動產生的 ServiceAccount，慣例上不算進「未使用要清理」的範圍**，就算目前沒有 Pod 明確指定用它，也不建議刪除——它是每個 namespace 天生就有的資源（[Record.md Day 32](Record.md#day-32) 提過），清理未使用 SA 這種任務通常針對「使用者自己建立的」SA，不是系統自動管理的物件
 - 這題的**核心精神是「安全治理」而不是「單純的 CRUD」**：`-sa` 命名規則、禁止自動掛載 token、清理未使用資源，三件事合起來是在降低「多餘的 ServiceAccount 帶著能打 API 的憑證到處留著」這種攻擊面——跟 [Record.md Day 32](Record.md#day-32) 討論過的「最小權限原則」（`Role` 只給需要的 `verbs`）是同一種資安思維的不同層面：一個管「能做什麼」，一個管「憑證會不會被不必要地掛出去、留下來」
+
+## 題目17 - 更新 Deployment 並暴露 Service
+
+**備註（原題）**：建議導出 yaml 修改後重建。
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`ckad00017`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要擴展一個現有的應用程式，並將其公開在基礎設施內。
+
+**Task**：
+
+1. 更新 namespace `ckad00017` 中的 Deployment `ckad00017-deployment`：
+   - 讓它運行 **5 個 Pod 副本**
+   - 為 Pod 加上標籤 `tier: dmz`
+2. 在 namespace `ckad00017` 中建立一個名為 `rover` 的 **NodePort** Service，在 **TCP port 81** 上公開 Deployment `ckad00017-deployment`。
+
+**相關資源**：[CKAD/17-ckad00017-deployment.yaml](CKAD/17-ckad00017-deployment.yaml)（修改「既有」Deployment 後的目標狀態，image 是 `vicuu/nginx:hello81`——這個 image 真的有實作監聽在 81 port、回應 `Hello World ^_^ / Port 81`）、[CKAD/17-rover-service.yaml](CKAD/17-rover-service.yaml)（新建的 NodePort Service）——**已在本機 minikube 完整實測，包含中間踩過的幾個坑**
+
+**解法指令**：
+
+```bash
+kubectl config use-context k8s
+
+# 1. 依備註建議，先把既有 Deployment 匯出成 yaml 再修改（比直接 kubectl edit 更好掌握變更）
+kubectl get deploy ckad00017-deployment -n ckad00017 -o yaml > ckad00017-deployment.yaml
+# 編輯 ckad00017-deployment.yaml：
+#   spec.replicas 改成 5
+#   spec.template.metadata.labels 加上 tier: dmz（不要動 spec.selector！）
+kubectl apply -f ckad00017-deployment.yaml
+
+# 2. 建立 NodePort Service
+kubectl apply -f CKAD/17-rover-service.yaml
+# 或指令式一步到位：
+kubectl expose deployment ckad00017-deployment -n ckad00017 \
+  --name=rover --type=NodePort --port=81 --target-port=81
+```
+
+`CKAD/17-ckad00017-deployment.yaml` 關鍵欄位：
+
+```yaml
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: ckad00017-deployment   # 不能改，immutable
+  template:
+    metadata:
+      labels:
+        app: ckad00017-deployment
+        tier: dmz                 # 新加的標籤
+    spec:
+      containers:
+      - name: nginx
+        image: vicuu/nginx:hello81   # 這個 image 真的監聽在 81，不是預設的 80
+        ports:
+        - containerPort: 81
+```
+
+`CKAD/17-rover-service.yaml` 關鍵欄位：
+
+```yaml
+spec:
+  type: NodePort
+  selector:
+    app: ckad00017-deployment     # 對到 Deployment 的 Pod 標籤，扁平寫法，不要多包一層
+  ports:
+  - protocol: TCP
+    port: 81
+    targetPort: 81                # 對到 image 實際監聽的 81，不是隨便填數字
+```
+
+**驗證**（依序排除三種常見卡住的原因，已實測跑過一輪）：
+
+```bash
+kubectl get deploy ckad00017-deployment -n ckad00017
+# REPLICAS 應該是 5/5
+
+kubectl get pods -n ckad00017 --show-labels
+# 應該看到每個 Pod 都有 tier=dmz
+
+kubectl get svc rover -n ckad00017
+# TYPE 是 NodePort，PORT(S) 應該是 81:<隨機nodePort>/TCP
+
+# 關鍵一步：先確認 Service 真的有連到 Pod（Endpoints 不能是 <none>）
+kubectl get endpoints rover -n ckad00017
+# 應該列出 5 個 <PodIP>:81
+
+# 從 host 機器測 NodePort（minikube docker driver 用這個，不是 ClusterIP）
+curl http://$(minikube ip):<nodePort>
+# Hello World ^_^ / Port 81
+
+# 或用 minikube 內建指令自動組好 URL
+minikube service rover -n ckad00017 --url
+```
+
+**對應考綱 Domain**：
+
+`Application Deployment`（20%）→ 修改既有 Deployment（延續 [題目5](#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange)/[題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation) 的套路）、`Services and Networking`（20%）→ `建立與除錯 Service 存取`（延續 [Record.md Day 9](Record.md#day-9) 的 `NodePort` 類型、[Record.md Day 13](Record.md#day-13) 的 port/targetPort 對照）
+
+**易錯點／踩坑筆記**：
+
+- **`spec.selector.matchLabels` 是 immutable（建立後不可修改）欄位**：這題「幫 Pod 加標籤」的正確位置是 **`spec.template.metadata.labels`**，不是 `spec.selector`——如果手滑把新標籤也加進 `spec.selector.matchLabels`，`kubectl apply` 會直接被拒絕（`field is immutable`）。只要 `template.labels` 有涵蓋 `selector` 原本要求的 key/value，多加其他標籤完全不影響 selector 照常匹配
+- 備註「建議導出 yaml 修改後重建」對 **Deployment** 而言，實際上是「匯出 → 編輯 → `kubectl apply`」（跟 [公用知識](#修改既有物件優先用匯出--編輯--apply少用-kubectl-edit) 提過的做法一致），**不是**像 [題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod) 那種單獨 Pod 需要真的 `delete` 再重建——Deployment 修改 `template`／`replicas` 直接 `apply` 就會觸發 rolling update，用不著刪除
+- **`Service.spec.selector` 是扁平的 key/value map，不能多包一層 `labels:`**——實測踩過這個坑：`selector: {labels: {app: xxx}}` 這種寫法 `kubectl apply` 會直接報 `unrecognized type: string` 錯誤，正確寫法是 `selector: {app: xxx}` 直接放，跟 `matchLabels` 底下那層很像但**不是同一種欄位結構**，容易搞混
+- **`selector` 對錯人 namespace/名稱，Service 會建立成功但完全連不到任何 Pod**：實測套用過一份 `selector: {app.kubernetes.io/name: MyApp}` 的 yaml，`kubectl apply` 沒有報錯、Service 也正常建立，但 `kubectl get endpoints rover` 顯示 `<none>`——**Service 建立成功≠設定正確**，`selector` 打錯字或用錯 key，Kubernetes 不會主動告訴你「找不到 Pod」，一定要額外查 `Endpoints` 才會發現
+- **`type` 沒寫會預設變成 `ClusterIP`**，不是 `NodePort`，這題明確要求 `NodePort`，`spec.type: NodePort` 這個欄位不能漏
+- **`containerPort`/`targetPort` 該填多少，取決於這題實際用的 image**：這題用的是 `vicuu/nginx:hello81`——這是特別做來監聽在 81 port 的自訂 image（回應內容就寫著 `Port 81`），所以這題 `targetPort: 81` 才是對的；如果換成一般 `nginx:stable`/`nginx:1.14.2` 這種預設監聽 80 的標準 image，就要填 `80`——**沒有一體適用的答案，永遠要先確認 image 實際監聽哪個 port**，不能看到題目給的數字就直接套用到 `targetPort`
+- **`ClusterIP` 從 host 機器（minikube 外部）是打不通的，這是設計上的本質限制，不是設定錯誤**：實測 `curl <ClusterIP>:81` 從 host 終端機執行會直接 hang 住（timeout），但同一個 `curl <ClusterIP>:81` 在 `minikube ssh` 進去 node 裡面執行卻能正常回應——ClusterIP 只是 cluster 內部 iptables/ipvs 轉發規則產生的虛擬位址，只有 **Pod 或 Node 自己**能路由到它，host 機器在這個網路範圍之外
+- **`ClusterIP` 跟 `NodePort` 是兩個獨立的位址/port 組合，不能混搭**：`curl <ClusterIP>:<nodePort>` 這種寫法一定打不通，因為 NodePort 是開在**每個 Node 的實體 IP** 上（`minikube ip` 拿到的位址），不是開在 ClusterIP 上，`ClusterIP` 那個位址上根本沒人監聽 nodePort 那個號碼
+- **從 host 機器驗證 minikube 的 NodePort Service，有三種可行方式**：① `curl http://$(minikube ip):<nodePort>`（最直接）、② `minikube service <svc> -n <ns> --url`（minikube 內建指令自動組好 URL）、③ `minikube ssh` 進節點內部後改用 `curl <ClusterIP>:<port>` 或 `curl localhost:<nodePort>`；另外也可以用 `kubectl run <tmp-pod> --rm -i --restart=Never --image=curlimages/curl -- curl <ClusterIP>:<port>` 建一個用完即丟的 Pod，從 cluster 內部直接測 ClusterIP，不用進 node
+- 排查「Service 連不通」的建議順序：① `kubectl get endpoints <svc>` 確認有沒有連到 Pod（沒有就是 `selector` 錯）→ ② `kubectl get svc <svc>` 確認 `type`/`port` 對不對 → ③ 確認 `targetPort` 對不對到 container 實際監聽的 port → ④ 確認自己是從**哪裡**測試（host 只能用 NodePort、cluster 內部才能用 ClusterIP），這四層任何一層錯了都會讓 `curl` 打不通，但錯誤訊息（或根本沒有錯誤訊息）不會直接告訴你是哪一層，要照順序一步步排除

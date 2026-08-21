@@ -1,0 +1,14 @@
+# 用 TCP port 81 公開 ckad00017-deployment 的 NodePort Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rover
+  namespace: ckad00017
+spec:
+  type: NodePort
+  selector:
+    app: ckad00017-deployment
+  ports:
+    - protocol: TCP
+      port: 81
+      targetPort: 81

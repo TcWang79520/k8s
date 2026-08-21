@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ckad00017-deployment
+  namespace: ckad00017
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: ckad00017-deployment
+  template:
+    metadata:
+      labels:
+        app: ckad00017-deployment
+        tier: dmz
+    spec:
+      containers:
+      - name: nginx
+        image: vicuu/nginx:hello81
+        ports:
+        - containerPort: 81
