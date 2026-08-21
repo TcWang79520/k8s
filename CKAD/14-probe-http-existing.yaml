@@ -1,0 +1,28 @@
+# 模擬考場既有的 Deployment probe-http（題目沒給 Quick Reference/namespace，
+# 練習先假設在 default，實際考試看清楚 Quick Reference 裡寫的 namespace）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probe-http
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: probe-http
+  template:
+    metadata:
+      labels:
+        app: probe-http
+    spec:
+      containers:
+      - name: probe-http
+        image: vicuu/helloweb:v1
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /healthz/return200
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 20

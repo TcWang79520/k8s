@@ -1,0 +1,27 @@
+# 練習用：模擬「Liveness Probe 設定錯誤導致應用程式連不上」的情境
+# nginx 實際監聽 80，但 livenessProbe 故意打 8080，會一直失敗、container 被重啟
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: moth
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: moth-app
+  namespace: moth
+  labels:
+    app: moth-app
+spec:
+  containers:
+  - name: nginx
+    image: nginx:stable
+    ports:
+    - containerPort: 80
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 8080          # 錯誤：nginx 沒監聽這個 port，正確應該是 80
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 1

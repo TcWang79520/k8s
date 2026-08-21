@@ -14,12 +14,15 @@
 - [題目10 - RBAC 授權除錯（ServiceAccount 權限不足）](#題目10---rbac-授權除錯serviceaccount-權限不足)
 - [題目11 - 建立 ConfigMap 並掛載成 Volume](#題目11---建立-configmap-並掛載成-volume)
 - [題目12 - 建立 Secret 並以環境變數使用](#題目12---建立-secret-並以環境變數使用)
+- [題目13 - Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)
+- [題目14 - 幫既有 Deployment 加上 ReadinessProbe](#題目14---幫既有-deployment-加上-readinessprobe)
 
 ## 公用知識
 
 - `kubectl config get-contexts`：列出目前 kubeconfig 裡所有可用的 context
 - `kubectl config use-context k8s`：切換到指定 context（範例用 `k8s`）
 - `kubectl config set-context k8s --namespace=pod-resource`
+- `kubectl get pods -A`：撈出**所有 namespace** 的 Pod（`-A`/`--all-namespaces`），題目沒指定或說「可能在任何 namespace」時的第一步（見 [題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)）；同樣的 `-A` 也能加在 `get events`/`get deploy` 等其他資源上，不是 `get pods` 專屬
 - （未來陸續補充的通用指令都放這裡）
 
 ### `containerPort` vs Service 的 `port` / `targetPort`
@@ -34,6 +37,38 @@
 
 - `port` 跟 `targetPort` 可以不同（例如對外 `port: 80`、實際轉給 Pod 的 `targetPort: 8080`）
 - 只宣告 `containerPort`、沒建 Service 的題目（例如 [題目9](#題目9---建立-deployment-並指定環境變數)），單純就是文件宣告，不用多想要不要建 Service
+
+### livenessProbe / readinessProbe / startupProbe 完整欄位對照
+
+三種 Probe **yaml 欄位結構完全一樣**，差別只在「探測失敗後 Kubernetes 會做什麼」（`livenessProbe` 基礎概念見 [Record.md Day 11](Record.md#day-11)，這裡把 `readinessProbe`/`startupProbe` 跟完整欄位一起補齊）：
+
+| Probe 類型 | 探測失敗的後果 | 用途 |
+| --- | --- | --- |
+| `livenessProbe` | container 被 kubelet **重啟**（跟 `restartPolicy` 邏輯連動） | 偵測「服務卡死了、要不要重開」——服務還活著但沒回應（例如 deadlock） |
+| `readinessProbe` | Pod 被**移出 Service 的 Endpoints**，不會重啟，只是暫時不接新流量 | 偵測「服務現在能不能接流量」——例如啟動中、暫時在做重載入設定、依賴的下游還沒連上 |
+| `startupProbe` | 探測**成功前**，`livenessProbe`/`readinessProbe` 完全不會開始執行；探測失敗達到 `failureThreshold` 才重啟 container | 給啟動特別慢的應用（例如要跑很久的初始化）多一點寬限期，避免還沒啟動完就被 `livenessProbe` 誤判、反覆重啟 |
+
+**三種探測方式**（`httpGet`/`exec`/`tcpSocket` 三選一寫在同一個 Probe 底下，`grpc` 是較新版本才有的第四種）：
+
+| 探測方式 | 判定成功的條件 | 範例欄位 |
+| --- | --- | --- |
+| `httpGet` | 對指定 `path`/`port` 發 HTTP GET，回應碼 `200`~`399` 視為成功 | `path: /healthz`、`port: 80`、`scheme: HTTP`（也可 `HTTPS`）、`httpHeaders`（可加自訂 header） |
+| `exec` | 在 container 內執行指定指令，**exit code 為 `0`** 視為成功 | `command: ["cat", "/tmp/healthy"]` |
+| `tcpSocket` | 指定的 `port` 能成功建立 TCP 連線就視為成功，不管有沒有回應內容 | `port: 3306` |
+| `grpc`（k8s 1.24+） | 對指定 `port` 發 gRPC Health Checking Protocol 請求 | `port: 50051`、`service:`（可選，指定要檢查的 gRPC service 名稱） |
+
+**共同計時／閾值欄位**（[題目14](#題目14---幫既有-deployment-加上-readinessprobe) 實際考過 `initialDelaySeconds`/`periodSeconds`）：
+
+| 欄位 | 意義 | 預設值 |
+| --- | --- | --- |
+| `initialDelaySeconds` | container 啟動後，延遲幾秒才開始第一次探測 | `0`（container 一啟動就馬上探測） |
+| `periodSeconds` | 每隔幾秒探測一次 | `10` |
+| `timeoutSeconds` | 單次探測最多等幾秒沒回應就算逾時失敗 | `1` |
+| `successThreshold` | 連續成功幾次才視為「恢復正常」（`Failure`→`Success` 的判定次數） | `1`（`livenessProbe`/`startupProbe` 只能設 `1`，不能改） |
+| `failureThreshold` | 連續失敗幾次才判定為「真的異常」，觸發重啟或移出 Endpoints | `3` |
+
+- `successThreshold` 只有 `readinessProbe` 可以設大於 `1` 的值（例如要求連續成功 3 次才恢復接流量，避免服務忽好忽壞時流量一直被打進去又拔掉）；`livenessProbe`/`startupProbe` 這個欄位固定只能是 `1`，寫其他數字會被 API server 拒絕
+- 同一個 container 可以**同時**設定 `livenessProbe`、`readinessProbe`、`startupProbe` 三種，互不衝突，各自獨立判斷、各自觸發各自的行為
 
 ## 題目1 - CronJob 手動觸發 Job
 
@@ -807,3 +842,183 @@ kubectl exec -it nginx-secret -n default -- printenv COOL_VARIABLE
 - 建立 Secret 時，**`kubectl create secret generic --from-literal` 建出來的值會自動 base64 編碼存進 `data` 欄位**，這是 Secret 跟 ConfigMap 最大的差異（ConfigMap 明文存在 `data`，Secret 是 base64 存在 `data`，或用 `stringData` 讓 Kubernetes 幫你自動轉換）；這份練習 yaml 用 `stringData: {key1: value12}` 明文寫，`kubectl apply` 之後 Kubernetes 會自動轉成 base64 存進 `data`，兩種寫法效果一樣，`stringData` 純粹是給人看的方便寫法
 - Container 裡讀出來的環境變數值**已經是解碼後的明文**（`value12`），不會是 base64 字串——base64 編碼只發生在 etcd 儲存層，Kubernetes 在把值注入環境變數／掛載成檔案的當下就已經自動解碼了，這題驗證 `printenv COOL_VARIABLE` 應該直接看到 `value12`，如果看到一串 base64 亂碼，代表 yaml 寫錯了（例如誤把 base64 值直接塞進 `stringData`）
 - 同樣要留意 [題目11](#題目11---建立-configmap-並掛載成-volume) 提過的殘留 namespace 坑：驗證指令記得帶 `-n default`，不要依賴當前 context 的預設 namespace
+
+## 題目13 - Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）
+
+**備註（原題）**：較為耗時，實際考試有 5 個 Pod 要查，Pod 要刪了重建。
+
+**Quick Reference**：
+
+- Cluster/配置環境：`dk8s`（跟前面題目用的 `k8s` 不同，這題原文就是寫 `dk8s`，照抄不改）
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context dk8s`），不這樣做可能導致零分。
+
+由於 Liveness Probe 發生了問題，你無法存取一個應用程式。該應用程式可能在**任何 namespace** 中運行。
+
+1. 找出對應的 Pod，並將其名稱和 namespace 寫入檔案 `/ckad/CKAD00011/broken.txt`，格式：
+   ```text
+   <namespaceName>/<podName>
+   ```
+   （檔案已存在）
+2. 用 `kubectl get events` 取得相關錯誤事件，寫入檔案 `/ckad/CKAD00011/error.txt`，**必須用 `-o wide` 輸出格式**（不用會扣分）。（檔案已存在）
+3. 修復故障 Pod 的 Liveness Probe 問題。
+
+**相關資源**：[CKAD/13-broken-liveness.yaml](CKAD/13-broken-liveness.yaml)（自建的練習情境：`moth` namespace 下的 `moth-app` Pod，`livenessProbe` 故意打錯 port，模擬「Liveness Probe 設定錯誤」）
+
+**解法指令**（已在本機 minikube 完整實測跑過一輪，包含刪除重建）：
+
+```bash
+kubectl config use-context dk8s
+
+# 1. 部署練習情境，重現「Pod 因 liveness probe 失敗一直被重啟」
+kubectl apply -f CKAD/13-broken-liveness.yaml
+```
+
+**第一步：跨所有 namespace 找出壞掉的 Pod**——這題的難點就是「不知道在哪個 namespace」：
+
+```bash
+# 1a. 先掃過所有 namespace 的 Pod，找 RESTARTS 異常或狀態不對勁的候選
+kubectl get pods -A
+
+# 1b. 對候選 Pod 用 describe，尾巴的 Events 區塊就能直接確認是不是 liveness probe 問題
+#     （不用另外再打一次 kubectl get events，describe 本身就會帶最近的事件）
+kubectl describe pod moth-app -n moth | tail
+# Events:
+#   Type     Reason     Age   From     Message
+#   ----     ------     ----  ----     -------
+#   Warning  Unhealthy  ...   kubelet  Liveness probe failed: Get "http://...:8080/": dial tcp ... connection refused
+#   Normal   Killing    ...   kubelet  Container nginx failed liveness probe, will be restarted
+```
+
+確認 `moth` namespace 底下的 `moth-app` 就是壞掉的 Pod。
+
+**第二步：寫入 `broken.txt`**：
+
+```bash
+mkdir -p /ckad/CKAD00011
+echo "moth/moth-app" > /ckad/CKAD00011/broken.txt
+```
+
+**第三步：用 `-o wide` 抓相關錯誤事件寫入 `error.txt`**——**用 Pod 名稱 `grep`**，而不是用 `unhealthy` 這種關鍵字篩，也不是整包不篩：只篩關鍵字可能漏掉 `Killing`/`BackOff` 這些同樣相關但不含 `unhealthy` 字樣的事件；完全不篩，如果該 namespace 還有其他 Pod（practice 環境常常是這樣），會混進不相關的事件——**篩 Pod 名稱剛好precise 對到「這個 Pod 的所有事件」，不多不少**：
+
+```bash
+kubectl get events -n moth -o wide | grep moth-app > /ckad/CKAD00011/error.txt
+```
+
+**第四步：修復 Liveness Probe（Pod 要刪了重建，這是這題「較耗時」的原因）**——單獨的 Pod（不是透過 Deployment 管理）**沒辦法直接 `kubectl edit` 改 `livenessProbe`**，因為 container 相關欄位在 Pod 建立後是不可變的（immutable），只能：
+
+```bash
+# 1. 把現有 Pod 的 yaml 匯出
+kubectl get pod moth-app -n moth -o yaml > moth-app.yaml
+
+# 2. 先備份一份原始檔，之後改壞了、或要對照原本錯在哪，都還有得救
+cp moth-app.yaml bak-moth-app.yaml
+
+# 3. 編輯 moth-app.yaml，修正 livenessProbe.httpGet.port（8080 → 80）
+sed -i 's/port: 8080/port: 80/' moth-app.yaml   # 依實際錯誤欄位調整，多處同值時建議手動開檔案編輯
+
+# 4. 用匯出的 yaml 刪除舊 Pod（等同 kubectl delete pod moth-app -n moth）
+kubectl delete -f moth-app.yaml
+
+# 5. 用修好的 yaml 重新建立
+kubectl apply -f moth-app.yaml
+```
+
+**驗證**：
+
+```bash
+kubectl get pod moth-app -n moth
+# RESTARTS 應該停在 0，不再持續增加
+
+kubectl get events -n moth --sort-by='.lastTimestamp' | tail -6
+# 最後幾筆事件應該是 Pulled/Created/Started，沒有新的 Unhealthy
+```
+
+**對應考綱 Domain**：
+
+`Application Observability and Maintenance`（15%）→ `Probes / health checks`、`Debugging in Kubernetes`（延續 [Record.md Day 11](Record.md#day-11) 學過的 `livenessProbe`，這題是第一次真正拿它來做**除錯**而不是建立，也是筆記系列第一次碰到「跨 namespace 找壞掉的物件」這種情境題）
+
+**易錯點／踩坑筆記**：
+
+- **「應用程式可能在任何 namespace」是這題最大的時間壓力來源**：不要一個一個 namespace 手動 `kubectl get pods -n X` 慢慢找，直接 `kubectl get pods -A` 或 `kubectl get events -A` 一次看全部；`kubectl get events -A --sort-by='.lastTimestamp'` 依時間排序、篩 `Unhealthy`/`Liveness` 關鍵字通常是最快定位到問題的方法，比盯著 RESTARTS 數字猜可靠——RESTARTS 數字可能因為 cluster 曾經重開機而每個 Pod 都有殘留次數，不代表「現在」還在壞
+- **`broken.txt` 的格式是 `<namespace>/<podName>`，順序不要寫反**（不是 `<podName>/<namespace>`），這種純文字格式題，格式錯字面上就是錯，跟 yaml 語法錯誤一樣會被扣分，寫完最好 `cat` 出來確認一次
+- **`-o wide` 是這題明確警告「不用會扣分」的必要 flag**，`kubectl get events` 預設輸出跟 `-o wide` 輸出的欄位不同（`-o wide` 會多列出 `SUBOBJECT`／`SOURCE`／`REPORTING CONTROLLER` 這類欄位），養成看到題目特別註明輸出格式，就照抄不要automatically 用預設值的習慣
+- **單獨建立的 Pod，container 相關欄位（包括 `livenessProbe`）建立後不可變（immutable）**，`kubectl edit pod` 改這類欄位會被 API server 拒絕（`field is immutable`）——這也是備註寫「Pod 要刪了重建」的原因：正確流程是「匯出 yaml → 修正 → 刪除舊 Pod → apply 新 yaml」，這跟 [題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation) 修改 **Deployment** 的 SecurityContext 可以直接 `kubectl edit`／改完自動 rolling update 不同——Deployment 修改 Pod template 會觸發**新 Pod 自動取代舊 Pod**，但單獨的 Pod 沒有上層 controller 幫你做這件事，要手動刪除+重建
+- 實際考試有 5 個 Pod 要一一檢查（這題備註提到的），代表**壞掉的 Pod 可能不只一個、或者要從 5 個候選裡篩出真正有問題的那個**——每找到一個「看起來有問題」的 Pod，先用 `kubectl describe pod` 或 `kubectl get events` 確認真的是 liveness probe 的問題（不是其他原因，例如 `ImagePullBackOff`、`OOMKilled`），避免抓錯目標寫進 `broken.txt`
+- `sed -i 's/port: 8080/port: 80/'` 這種字串替換方式只適合「明確知道錯在哪一行、且不會誤改到其他相同字串」的簡單情況；如果 yaml 裡有多處 `port: 8080`（例如 `containerPort`跟 `livenessProbe.httpGet.port` 剛好都寫 `8080`），無腦 `sed` 可能會改錯地方，這種情況還是手動開檔案編輯比較保險
+- **`kubectl describe pod <name> -n <ns> | tail` 是比另外打一次 `kubectl get events` 更快的候選確認法**：`describe pod` 輸出本身最後就有一段 `Events:`，`| tail` 直接看到最近幾筆，不用兩支指令來回切換——`kubectl get pods -A` 負責「大範圍篩出候選」，`describe ... | tail` 負責「針對候選快速確認原因」，兩者搭配比單用其中一個更快
+- **修改前先 `cp` 一份備份再動手**（`cp moth-app.yaml bak-moth-app.yaml`）：這題流程有「匯出 → 編輯 → 刪除 → 重建」四個步驟，中間任何一步改錯（例如 `sed` 改壞了 yaml 格式、或改錯了欄位）都可能導致重建失敗，這時候已經先 `kubectl delete` 掉舊 Pod 了，沒有備份就等於三個步驟都要重來；養成修改任何「已經在 cluster 上運作」的物件前先備份一份原始 yaml 的習慣，是比較穩妥的除錯節奏，不只這題適用
+
+## 題目14 - 幫既有 Deployment 加上 ReadinessProbe
+
+**Quick Reference**：
+
+- Cluster/配置環境：`dk8s`（原題只給了這行，沒有另外列 Quick Reference 區塊標明 namespace，練習先假設 `default`，實際考試以畫面上真正顯示的 namespace 為準）
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context dk8s`），不這樣做可能導致零分。
+
+修改現有的 Deployment `probe-http`，增加 `readinessProbe` 探測器，規格如下：
+
+- 使用 `httpGet` 進行探測
+- 探測路徑為 `/healthz/return200`
+- 探測 port 為 `80`
+- 執行第一次探測前應等待 `15` 秒（`initialDelaySeconds`）
+- 探測時間間隔為 `20` 秒（`periodSeconds`）
+
+**相關資源**：[CKAD/14-probe-http-existing.yaml](CKAD/14-probe-http-existing.yaml)——**已經是修好之後的最終版本**（image 是 `vicuu/helloweb:v1`，這個 image 真的有實作 `/healthz/return200` 這個路徑，`readinessProbe` 也已經寫進去了），保留當作「答案參照」；下面的解法指令示範的是**考場實際情境**：假設一開始拿到的 `probe-http` 完全沒有 `readinessProbe`，示範怎麼用 `kubectl patch` 幫既有 Deployment 補上去
+
+**解法指令**（已在本機 minikube 實測套用並驗證欄位正確、Pod 確實變成 `Ready`）：
+
+```bash
+kubectl config use-context dk8s
+
+# 情境重現：先部署一份「還沒加 readinessProbe」的版本
+kubectl create deployment probe-http -n default --image=vicuu/helloweb:v1 --port=80
+
+# 用 kubectl patch 直接補上 readinessProbe（假設只有一個 container，index 是 0）
+kubectl patch deployment probe-http -n default --type='json' -p='[
+  {"op": "add", "path": "/spec/template/spec/containers/0/readinessProbe", "value": {
+    "httpGet": {"path": "/healthz/return200", "port": 80},
+    "initialDelaySeconds": 15,
+    "periodSeconds": 20
+  }}
+]'
+```
+
+也可以用 `kubectl edit` 或「匯出 → 編輯 → apply」（沒有編輯器可用時的備案，見 [題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation)）手動補上同一段：
+
+```yaml
+        readinessProbe:
+          httpGet:
+            path: /healthz/return200
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 20
+```
+
+**驗證**：
+
+```bash
+kubectl get deploy probe-http -n default -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
+# {"failureThreshold":3,"httpGet":{"path":"/healthz/return200","port":80,"scheme":"HTTP"},
+#  "initialDelaySeconds":15,"periodSeconds":20,"successThreshold":1,"timeoutSeconds":1}
+
+kubectl get pods -n default -l app=probe-http
+# READY 應該是 1/1（用 vicuu/helloweb:v1 這個真的有實作該路徑的 image 才驗證得出來）
+```
+
+**對應考綱 Domain**：
+
+`Application Observability and Maintenance`（15%）→ `Probes / health checks`（延續 [Record.md Day 11](Record.md#day-11) 的 `livenessProbe`跟[題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod) 的 debug 情境，這題是筆記系列第一次真正建立 `readinessProbe`）
+
+**易錯點／踩坑筆記**：
+
+- **`livenessProbe` 跟 `readinessProbe` 的 yaml 欄位結構完全一樣**（都是 `httpGet`/`tcpSocket`/`exec` + `initialDelaySeconds`/`periodSeconds`/`timeoutSeconds`/`successThreshold`/`failureThreshold`），差別純粹在**用途**：`livenessProbe` 探測失敗 → container 被 kubelet **重啟**；`readinessProbe` 探測失敗 → Pod 被**移出 Service 的 Endpoints**（不會重啟，只是暫時不接流量），兩者可以同時設定在同一個 container 上，互不衝突
+- 沒有指定 `containerPort` 名稱時，`httpGet.port` 直接寫數字 `80` 就好，不用像 [Record.md Day 13](Record.md#day-13) 提過的可以用 named port 這種寫法，題目給的是數字就照抄數字
+- 這題是**修改既有 Deployment**（不是新建），跟 [題目8](#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation)、[題目5](#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange) 是同一種題型套路——考場常見的「改一個已經在跑的物件」類型，重點永遠是先查清楚現況（`kubectl get deploy ... -o yaml`）、確認 container 名稱/index，再用 `edit`／`patch`／「匯出改完 apply」三選一動手，不要自己重寫一份新 yaml 整個 `apply` 蓋過去（容易漏掉原本就有的欄位，例如 `resources`、`env`）
+- `kubectl set` 底下**沒有** `probe` 這個子指令（跟 `kubectl set env`/`kubectl set resources`/`kubectl set serviceaccount` 不同），沒有「一行指令幫 Deployment 加探測器」這種捷徑，只能透過 `edit`/`patch`/改 yaml 這幾種方式，考試時別浪費時間找不存在的指令
+- 練習素材一開始用 `nginx:stable` 當 image，但 `nginx:stable` 沒有 `/healthz/return200` 這個路徑，探測會一直失敗、`READY` 卡在 `0/1`——只能驗證「yaml 欄位寫對」，驗證不了「Pod 真的變 `Ready`」；換成 `vicuu/helloweb:v1`（真的有實作這個路徑）之後，`READY` 才會變成 `1/1`。這也是一個提醒：**readinessProbe 探測會不會過，跟 yaml 語法對不對是兩回事**，yaml 寫得再標準，應用程式本身沒有那個 endpoint 一樣過不了，考試時如果 Pod 遲遲不 Ready，先確認題目給的路徑跟 image 是不是真的匹配，別只顧著檢查 yaml 縮排
