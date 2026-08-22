@@ -21,6 +21,7 @@
 - [題目17 - 更新 Deployment 並暴露 Service](#題目17---更新-deployment-並暴露-service)
 - [題目18 - 用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊](#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)
 - [題目19 - Ingress 排錯-1](#題目19---ingress-排錯-1)
+- [題目20 - Ingress 排錯-2](#題目20---ingress-排錯-2)
 
 ## 公用知識
 
@@ -1539,3 +1540,97 @@ minikube ssh -- "curl http://192.168.49.2/hello"
 - **舊版 `kubernetes.io/ingress.class` annotation vs 新版 `spec.ingressClassName`**：現代 `ingress-nginx`（v1.x）預設只認 `ingressClassName`，除非 controller 有開 `--watch-ingress-without-class=true` 才會相容舊 annotation——這題環境剛好有開，所以沒有造成連線問題，但這是**環境相依**的行為，不是 Ingress 語法本身保證正確，實際考場如果 `kubectl get ingress` 顯示 `CLASS: <none>` 卻連不通，這就是該檢查的方向
 - 排查「Ingress 打不通」的建議順序：① 確認 Deployment 的 Pod 是否 `Running`（這題已知沒問題可跳過）→ ② `kubectl get endpoints <svc>` 確認 Service 有沒有連到 Pod（這題卡在這一步：selector 錯）→ ③ `kubectl describe ingress` 確認 `Backends` 有沒有指到健康的 Service/Pod → ④ 確認 Ingress Controller 本身是否正常運作、有沒有指定 `ingressClassName`
 - **驗證要分層測試**：先測 Service（`curl <ClusterIP>:<port>`）排除是不是 Service 本身的問題，再測完整 Ingress 路徑（打 Ingress Controller 的入口 + 題目指定的路徑），兩層都要從 **`minikube ssh` 內部**測（host 機器打不到 ClusterIP，這是[題目17](#題目17---更新-deployment-並暴露-service)學過的網路範圍限制）；`ingress-nginx` 在 minikube 上除了 `NodePort`，也會直接綁在節點的 80/443（`minikube ip` 那個位址），所以進到 `minikube ssh` 之後直接打 `192.168.49.2/hello` 或 `localhost:31280/hello` 都能測到完整路徑
+
+## 題目20 - Ingress 排錯-2
+
+**備註（原題）**：對應的 svc 不存在。
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`ingress-kk`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+在 namespace `ingress-kk` 下有一個 Ingress，但它似乎無法被正常存取，請找出原因並修復。
+
+> ⚠️ 重要注意事項：這題的 **Deployment 是正確的，請不要修改 Deployment**。
+
+**跟題目19 的關鍵差異**：[題目19](#題目19---ingress-排錯-1) 是「Service、Ingress 都存在，但欄位寫錯」；這題備註直接講明**對應的 Service 根本不存在**——不是改欄位，是要**從零新建一個 Service**，而且新建的 Service 要同時對上兩邊：`name`/`port` 要對到 Ingress 的 `backend.service` 設定，`selector`/`targetPort` 要對到 Deployment 實際的 Pod 標籤跟 `containerPort`。這題沒有給 Service 的清單檔案可以參考修改，得自己從 Deployment 跟 Ingress 兩份資訊反推出 Service 該長什麼樣子。
+
+**相關資源**：
+
+- [CKAD/20-deployment.yaml](CKAD/20-deployment.yaml)——模擬考場既有、**正確**的 Deployment（`kk-deployment`，`app: kk-web`、`image: vicuu/nginx:hello81`、`containerPort: 81`），只供參考、不要修改
+- [CKAD/20-ingress.yaml](CKAD/20-ingress.yaml)——模擬考場既有的 Ingress（`ingress-kk-ingress`，`host: kk.example.com`、`path: /hello`），語法本身沒錯，但指到的 `backend.service.name: nginxsvc-kk` 在 cluster 上不存在
+- [CKAD/20-service.yaml](CKAD/20-service.yaml)——**這題唯一該新增的物件**，從 Deployment/Ingress 兩邊反推出來的 Service（`nginxsvc-kk`）
+
+> 這三份 yaml 目前**只是先寫好**，還沒在本機 minikube 套用驗證（使用者要求先不要執行 `kubectl apply`）。
+
+**解法指令**（尚未執行，供之後練習/驗證參考）：
+
+```bash
+kubectl config use-context k8s
+
+# 1. 先看目前 namespace 裡實際有哪些資源——這一步就會發現只有 deploy 跟 ingress，沒有 svc
+kubectl get deploy,svc,ingress -n ingress-kk
+
+# 2. 查 Ingress 的 backend 設定，抓出它期待的 Service 名稱／port
+kubectl get ingress ingress-kk-ingress -n ingress-kk -o yaml
+# 或用 describe，Backends 那欄會直接顯示 <error: endpoints "nginxsvc-kk" not found>，
+# 這行錯誤訊息本身就把「該建立哪個名字的 Service」講得很清楚
+kubectl describe ingress ingress-kk-ingress -n ingress-kk
+
+# 3. 查 Deployment 的 Pod 標籤／containerPort，決定新 Service 的 selector／targetPort
+kubectl get deploy kk-deployment -n ingress-kk -o yaml | grep -A2 "labels:\|containerPort"
+
+# 4. 用查到的資訊建立 Service（名稱、port 對 Ingress；selector、targetPort 對 Deployment）
+kubectl apply -f CKAD/20-service.yaml
+# 或用指令式，直接從 Deployment 產生對應的 Service：
+kubectl expose deployment kk-deployment -n ingress-kk --name=nginxsvc-kk --port=80 --target-port=81
+```
+
+`CKAD/20-service.yaml` 關鍵欄位：
+
+```yaml
+metadata:
+  name: nginxsvc-kk      # 對到 Ingress 的 backend.service.name
+spec:
+  selector:
+    app: kk-web            # 對到 Deployment 的 Pod 標籤
+  ports:
+  - protocol: TCP
+    port: 80                # 對到 Ingress 的 backend.service.port.number
+    targetPort: 81          # 對到 Deployment 的 containerPort（這題 image 監聽在 81，不是 80）
+```
+
+**驗證**（等實際套用後再執行）：
+
+```bash
+kubectl get svc nginxsvc-kk -n ingress-kk
+# 應該看得到這個 Service 了
+
+kubectl get endpoints nginxsvc-kk -n ingress-kk
+# 應該列出 Pod 的 <PodIP>:81，不是 <none>
+
+kubectl describe ingress ingress-kk-ingress -n ingress-kk
+# Backends 那欄應該顯示健康的 Pod IP，不再是 <error: endpoints "nginxsvc-kk" not found>
+
+# 從 minikube ssh 內部測試完整路徑（記得帶 Host header 跟路徑，這題 Ingress 有指定 host）
+minikube ssh -- "curl -H 'Host: kk.example.com' http://$(minikube ip)/hello"
+```
+
+**對應考綱 Domain**：
+
+`Services and Networking`（20%）→ `建立與除錯 Service 存取`、`Ingress`（延續 [題目19](#題目19---ingress-排錯-1) 的排錯邏輯，這題把「改錯欄位」升級成「補上完全缺失的物件」）
+
+**易錯點／踩坑筆記**：
+
+- **`kubectl describe ingress` 在 Service 不存在時，錯誤訊息會直接把答案寫出來**：`Backends` 那欄會顯示 `<error: endpoints "nginxsvc-kk" not found>`，這行訊息已經明講「我要找一個叫 `nginxsvc-kk` 的 Service（透過它的 Endpoints）但找不到」——遇到 Ingress 打不通，`kubectl describe ingress` 幾乎都該是第一個下的指令，很多時候答案已經直接寫在 `Backends`／`Events` 欄位裡，不用自己憑空猜
+- **新建的 Service 要同時滿足兩份「契約」**：一份是 Ingress 對它的期待（`name` 要對到 `backend.service.name`、`port.number` 要對到 `backend.service.port.number`），另一份是 Deployment 對它的期待（`selector` 要對到 Pod 的 `labels`、`targetPort` 要對到 `containerPort`）——**Service 是中間的橋樑，兩邊都要對得上，只對一邊、另一邊沒對到，Service 建立成功了但還是不會通**（例如 selector 對了但 `name` 沒對到 Ingress 要的名字，Ingress 一樣抓不到這個 Service）
+- 這題沒有任何一份現成的「錯誤的 Service yaml」可以拿來改，練習/考試時容易因為「找不到可以修的東西」而卡住——**這種情況正確的心態是「這題要新建，不是修改」**，跟[題目19](#題目19---ingress-排錯-1)那種「三份都在，改欄位」的排錯型態不一樣，讀題時第一件事是先 `kubectl get deploy,svc,ingress` 看清楚**現場實際有哪些物件**，不要預設三種資源都一定存在
+- `kubectl expose deployment` 是這題除了手寫 yaml 之外更快的做法，因為它會**直接讀 Deployment 的 `spec.selector` 當作新 Service 的 selector**，不用自己再手動查一次 Pod 標籤——但 `--name`／`--port`／`--target-port` 還是要自己對照 Ingress 的要求手動帶，指令不會幫你自動猜這些值
+- **`targetPort` 又是一個要對照 image 實際監聽 port 的例子**：這題 Deployment 用的是 `vicuu/nginx:hello81`（[題目17](#題目17---更新-deployment-並暴露-service)/[題目19](#題目19---ingress-排錯-1)都出現過的自訂 image，真的監聽在 81），新建的 Service `targetPort` 要填 `81`，不是看到 Ingress/Service 的 `port: 80` 就直覺填成 `80`——**`port`（Ingress／Service 對外用的號碼）不等於 `targetPort`（container 實際監聽的號碼），這題剛好又是兩個數字不一樣的設計**
+- 這題的 Ingress 規則有指定 `host: kk.example.com`（不像[題目19](#題目19---ingress-排錯-1)只用 `path` 導流），驗證時 `curl` 一定要帶 `-H "Host: kk.example.com"`，不然 Ingress Controller 會找不到符合的規則、回應 `404 default backend`——這也是「Service 修好了、Ingress Controller 也在跑，但 curl 還是不通」時容易漏掉的一步：先確認 Ingress 規則有沒有限定 `host`，有的話測試時一定要帶對應的 `Host` header
+- 跟[題目19](#題目19---ingress-排錯-1)合起來看，Ingress 排錯的核心邏輯其實只有一個：**Ingress → Service → Pod 這條鏈，任何一環「名字對不上」或「這個東西根本不存在」都會斷鏈**，差別只在斷在哪一環（題目19 是 Service selector 內部對不到 Pod；這題是 Ingress 要的 Service 整個不存在）——排查時養成「從 Ingress 往下查到 Service、再往下查到 Pod，每一步都用 `kubectl get`/`describe` 實際確認存不存在、對不對得上」的習慣，比憑印象猜更可靠

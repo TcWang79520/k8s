@@ -1,0 +1,16 @@
+# 這題唯一該新增的物件：從缺的 Service
+# name/port 要對到 Ingress 的 backend.service 設定（kk-svc, port 80），
+# selector/targetPort 要對到 Deployment 實際的 Pod 標籤（app: kk-web）與 containerPort（80）
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginxsvc-kk
+  namespace: ingress-kk
+spec:
+  selector:
+    app: kk-web
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 81
+

@@ -1,0 +1,21 @@
+# 模擬考場既有的 Deployment（正確、不要修改）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kk-deployment
+  namespace: ingress-kk
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kk-web
+  template:
+    metadata:
+      labels:
+        app: kk-web
+    spec:
+      containers:
+      - name: nginx
+        image: vicuu/nginx:hello81
+        ports:
+        - containerPort: 81
