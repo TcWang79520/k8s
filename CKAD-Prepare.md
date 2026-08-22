@@ -19,6 +19,7 @@
 - [題目15 - Deployment 升級策略、更新與回滾](#題目15---deployment-升級策略更新與回滾)
 - [題目16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA](#題目16---serviceaccount-命名規則禁止自動掛載-token清理未使用的-sa)
 - [題目17 - 更新 Deployment 並暴露 Service](#題目17---更新-deployment-並暴露-service)
+- [題目18 - 用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊](#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)
 
 ## 公用知識
 
@@ -1339,3 +1340,92 @@ minikube service rover -n ckad00017 --url
 - **`ClusterIP` 跟 `NodePort` 是兩個獨立的位址/port 組合，不能混搭**：`curl <ClusterIP>:<nodePort>` 這種寫法一定打不通，因為 NodePort 是開在**每個 Node 的實體 IP** 上（`minikube ip` 拿到的位址），不是開在 ClusterIP 上，`ClusterIP` 那個位址上根本沒人監聽 nodePort 那個號碼
 - **從 host 機器驗證 minikube 的 NodePort Service，有三種可行方式**：① `curl http://$(minikube ip):<nodePort>`（最直接）、② `minikube service <svc> -n <ns> --url`（minikube 內建指令自動組好 URL）、③ `minikube ssh` 進節點內部後改用 `curl <ClusterIP>:<port>` 或 `curl localhost:<nodePort>`；另外也可以用 `kubectl run <tmp-pod> --rm -i --restart=Never --image=curlimages/curl -- curl <ClusterIP>:<port>` 建一個用完即丟的 Pod，從 cluster 內部直接測 ClusterIP，不用進 node
 - 排查「Service 連不通」的建議順序：① `kubectl get endpoints <svc>` 確認有沒有連到 Pod（沒有就是 `selector` 錯）→ ② `kubectl get svc <svc>` 確認 `type`/`port` 對不對 → ③ 確認 `targetPort` 對不對到 container 實際監聽的 port → ④ 確認自己是從**哪裡**測試（host 只能用 NodePort、cluster 內部才能用 ClusterIP），這四層任何一層錯了都會讓 `curl` 打不通，但錯誤訊息（或根本沒有錯誤訊息）不會直接告訴你是哪一層，要照順序一步步排除
+
+## 題目18 - 用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊
+
+**Quick Reference**：
+
+- Cluster/配置環境：`nk8s`（跟前面題目的 `k8s`/`dk8s` 都不同，原題就是寫 `nk8s`，照抄不改）
+- Namespace：`ckad00018`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context nk8s`），不這樣做可能導致零分。
+
+**情境（Context）**：需要讓一個 Pod 只跟其他兩個指定的 Pod 通訊，不能跟這兩個以外的 Pod 通訊。
+
+**Task**：更新 namespace `ckad00018` 中的 Pod `ckad00018-newpod`，使其套用一個**只允許此 Pod 與 Pod `front` 和 `db` 之間收發流量**的 NetworkPolicy。
+
+> ℹ️ 提示：所有必要的 NetworkPolicy **均已建立**。
+
+> ⚠️ 警告：完成這題時，**不能 create／modify／delete 任何 NetworkPolicy**，只能使用現有的 NetworkPolicy。
+
+**這題的關鍵推理**：題目只叫你改 **Pod**，明確禁止碰 NetworkPolicy——代表 NetworkPolicy 的 `podSelector` 早就設定好了、只是還沒有 Pod 符合那個 selector。`ckad00018-newpod` 現在會被限制，唯一能做的事就是**幫它加上正確的 label**，讓它「被選中」去套用那條既有的 NetworkPolicy，不是去寫網路規則本身。
+
+**相關資源**：
+
+- [CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml)——**僅供環境模擬／參考**，模擬考場已經存在的 `front`/`db` Pod 跟 NetworkPolicy 本身（`podSelector: {role: restricted}`），練習時只是拿來確認 selector 長什麼樣子，**不是這題要交出去的答案**
+- [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml)——**這題唯一該修改的物件**，只加了 `role: restricted` 這個標籤
+
+> 這兩份 yaml 目前**只是先寫好**，還沒在本機 minikube 套用驗證（使用者要求先不要執行 `kubectl apply`）。
+
+**解法指令**（尚未執行，供之後練習/驗證參考）：
+
+```bash
+kubectl config use-context nk8s
+
+# 1. 先查清楚 namespace 裡有哪些既有的 NetworkPolicy，看它的 podSelector 長什麼樣
+kubectl get networkpolicy -n ckad00018
+kubectl describe networkpolicy -n ckad00018
+# 或直接看完整 yaml，確認 podSelector 的 key/value
+kubectl get networkpolicy -n ckad00018 -o yaml
+
+# 2. 確認 ckad00018-newpod「現在」的標籤，跟 NetworkPolicy 的 podSelector 對照，看差在哪個 key
+kubectl get pod ckad00018-newpod -n ckad00018 --show-labels
+
+# 3. 只補上 NetworkPolicy 需要的標籤（不要動其他東西，尤其不要動 NetworkPolicy 本身）
+kubectl label pod ckad00018-newpod -n ckad00018 role=restricted
+# 或用「匯出 → 編輯 → apply」：
+kubectl get pod ckad00018-newpod -n ckad00018 -o yaml > 18-ckad00018-newpod.yaml
+# 編輯 18-ckad00018-newpod.yaml，在 metadata.labels 補上 role: restricted
+kubectl apply -f 18-ckad00018-newpod.yaml
+```
+
+`CKAD/18-ckad00018-newpod.yaml` 關鍵欄位：
+
+```yaml
+metadata:
+  name: ckad00018-newpod
+  namespace: ckad00018
+  labels:
+    role: restricted   # 這是唯一需要加的東西，對到 NetworkPolicy 的 podSelector
+```
+
+**驗證**（等實際套用後再執行）：
+
+```bash
+kubectl get pod ckad00018-newpod -n ckad00018 --show-labels
+# labels 應該包含 role=restricted
+
+# 確認 NetworkPolicy 現在真的有選中這個 Pod
+kubectl describe networkpolicy allow-front-db-only -n ckad00018
+# 底下應該能看到符合 role=restricted 的 Pod 被列入套用範圍
+
+# 實際連線測試（需要三個 Pod 都在跑）：
+# 從 ckad00018-newpod 連 front/db 應該通，連其他任意第三方 Pod 應該不通
+kubectl exec ckad00018-newpod -n ckad00018 -- curl -m 3 <front的PodIP>
+kubectl exec ckad00018-newpod -n ckad00018 -- curl -m 3 <其他Pod的PodIP>   # 應該逾時/不通
+```
+
+**對應考綱 Domain**：
+
+`Services and Networking`（20%）→ `NetworkPolicies`（這是筆記系列第一次涉及這個知識點，`Record.md` CKAD TEST 章節目前標註「尚未涉及」）
+
+**易錯點／踩坑筆記**：
+
+- **NetworkPolicy 不是「指定 Pod 名稱」去管控，而是透過 `podSelector`（label selector）去選中一群 Pod**，這是這題最核心的觀念：題目給的三個角色（`ckad00018-newpod`/`front`/`db`）在 NetworkPolicy 的 yaml 裡完全不會用名稱出現，只會看到 `matchLabels`——這也是為什麼題目可以合理要求「不能碰 NetworkPolicy，只能改 Pod」：因為規則早就用標籤定義好了，缺的只是「哪些 Pod 符合這個標籤」
+- **題目故意設計成「已經有現成規則，只是東西沒對上」的情境**，這種題型的正確思路是**先讀規則、再補資料**，不是憑感覺亂猜——一定要先 `kubectl get networkpolicy -o yaml` 把 `podSelector`/`ingress[].from`/`egress[].to` 全部看過一遍，搞清楚哪個 label key/value 才是缺的那一塊，再對症下藥去改 Pod
+- `NetworkPolicy` 的 `ingress`（誰可以連進來）跟 `egress`（自己可以連出去給誰）**是分開控制的兩個方向**，題目說「只與 `front`、`db` 收發流量」（收＝ingress、發＝egress）代表兩個方向都要被限制在這兩個對象內——[CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml) 練習範例裡 `ingress`/`egress` 各自都寫了對應 `front`/`db` 的 `podSelector`，policyTypes 也要同時列出 `Ingress`、`Egress`，只寫一半會漏掉一個方向的限制
+- **一旦 `NetworkPolicy.spec.podSelector` 選中了某個 Pod，那個 Pod 在對應方向（Ingress/Egress）就會從「預設全開放」變成「預設全封鎖，只有規則允許的才通」**——這是 Kubernetes NetworkPolicy 的白名單機制：沒有任何 NetworkPolicy 選中的 Pod 預設暢通無阻，一旦被選中（不管透過哪一條規則），就必須有規則明確允許才放行，這也是為什麼幫 `ckad00018-newpod` 加上標籤這個動作本身就會產生限制效果，不用另外做什麼「啟用」的步驟
+- **NetworkPolicy 生效與否要靠 CNI 插件實作**（不是所有 CNI 都支援，minikube 預設的 CNI 不一定支援 NetworkPolicy）：練習時如果 `kubectl apply` 都成功、標籤也對了，但實際連線測試 `ingress`/`egress` 限制沒有生效，先確認 cluster 用的 CNI 支不支援 NetworkPolicy（例如 minikube 需要額外用 `--cni=calico` 這類參數啟用支援 NetworkPolicy 的網路插件，預設的 CNI 不一定會真的執行隔離）
+- 這兩份 yaml 目前**只是寫好、還沒套用驗證**（使用者要求先不要執行 `kubectl apply`），[CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml) 只是我方便你練習時參考「NetworkPolicy 長怎樣」用的環境模擬檔，**不是**這題要交的答案——這題真正的答案只有 [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml) 這一份，考試時千萬別誤把心力花在改 NetworkPolicy 上，題目已經明確警告不能動它

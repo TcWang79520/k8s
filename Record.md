@@ -23,6 +23,7 @@
 - [Day 31](#day-31) - StatefulSet（原教學系列沒教的元件，補充篇）
 - [Day 32](#day-32) - ServiceAccount 與 RBAC（Role / RoleBinding，補充篇）
 - [Day 33](#day-33) - RollingUpdate 深入：maxSurge / maxUnavailable（補充篇）
+- [Day 34](#day-34) - NetworkPolicy：Pod 之間的防火牆規則（補充篇）
 - [CKAD TEST](#ckad-test) - CKAD 考綱知識點與筆記進度對照
 
 ## 學習內容關鍵字
@@ -3400,6 +3401,125 @@ kubectl get deploy webapp -n default -o jsonpath='{.spec.strategy}'
 - **關鍵實測結論：`kubectl rollout undo` 只回滾 `spec.template`（Pod 版本），不會回滾 `spec.strategy`**——這兩者是獨立的東西，`strategy` 沒有版本歷史，回滾後如果要恢復原本的升級策略，得自己手動改回去。
 - 已在 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實際部署驗證：`kubectl patch` 設定策略 → `kubectl set image` 更新 → `kubectl rollout undo` 回滾，最終狀態確認是「新策略 + 舊 image」的組合，不是全部還原。
 
+# Day 34
+
+> 跟 [Day 31](#day-31)/[Day 32](#day-32)/[Day 33](#day-33) 一樣，這篇是原教學系列完全沒教的內容，起因是 [CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 第一次碰到 `NetworkPolicy`，補上 `Services and Networking` 這個 Domain（20%）裡唯一一塊「尚未涉及」的知識點。
+
+## 預設情況下，Pod 之間想連就連
+
+到目前為止這系列筆記接觸過的網路機制——[Day 5](#day5)/[Day 6](#day-6)/[Day 9](#day-9) 的 Service、[Day 17](#day-17) 的 `kube-dns`——全部都是在講「怎麼**找到**目標」（透過 Service 名稱、ClusterIP），完全沒有討論過「**能不能連**」這件事。原因是 Kubernetes 預設的網路模型非常單純粗暴：**同一個 cluster 裡，任何 Pod 都可以直接連到任何其他 Pod**，不管在哪個 namespace，中間沒有防火牆。
+
+這在小型/實驗環境沒什麼問題，但正式環境裡，「前端 Pod 可以直接連到別人的資料庫 Pod」這種事通常是資安事故等級的破口。`NetworkPolicy` 就是 Kubernetes 用來**限制 Pod 之間網路流量**的原生機制——本質上是一種「針對 Pod 的防火牆規則」，用 label selector 決定「這群 Pod」能跟「哪群 Pod」互通。
+
+## 核心心法：選中就變白名單
+
+`NetworkPolicy` 最重要、也最容易搞錯的一個心法：
+
+> **沒有任何 `NetworkPolicy` 選中的 Pod，網路是完全開放的（預設允許一切）；只要有任何一條 `NetworkPolicy` 透過 `podSelector` 選中了某個 Pod，那個 Pod 在對應的方向（`Ingress`/`Egress`）就會從「預設全開放」變成「預設全封鎖，只有規則明確允許的才通」。**
+
+這是一個**由「選中」觸發的白名單機制**，不是「寫了規則才生效、不寫就沒事」——只要 Pod 符合任何一條 `NetworkPolicy` 的 `podSelector`，那個方向立刻變成預設拒絕，這也是為什麼 [CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 只要「幫 Pod 加上正確的標籤」就能達成限制效果——不用另外做什麼「啟用」的動作，加標籤這件事本身就是啟用。
+
+## `NetworkPolicy` 的組成
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-front-db-only
+  namespace: ckad00018
+spec:
+  podSelector:
+    matchLabels:
+      role: restricted        # ① 這條規則要套用在「誰」身上
+  policyTypes:
+  - Ingress                   # ② 要管制哪個方向：進來的流量
+  - Egress                    #    跟／或 出去的流量
+  ingress:
+  - from:                     # ③ 誰可以「連進來」這個 Pod
+    - podSelector:
+        matchLabels:
+          app: front
+    - podSelector:
+        matchLabels:
+          app: db
+  egress:
+  - to:                       # ④ 這個 Pod 可以「連出去」給誰
+    - podSelector:
+        matchLabels:
+          app: front
+    - podSelector:
+        matchLabels:
+          app: db
+```
+
+- **① `spec.podSelector`**：跟 [Day 9](#day-9) Service 的 `selector`、[Day 8](#day-8) Deployment 的 `matchLabels` 是同一套 label selector 語法，決定這條規則要套用在哪些 Pod 身上。**空物件 `{}` 代表「選中這個 namespace 裡的所有 Pod」**，是常見的「全面套用基礎規則」寫法。
+- **② `spec.policyTypes`**：宣告這條規則管制哪些方向。只寫 `Ingress` 就只管進來的流量，出去的流量不受這條規則影響（但可能受其他規則影響）；兩個方向要一起管，兩個都要列出來——[CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)「收發流量都要限制」就是 `Ingress`+`Egress` 都要寫的情況。
+- **③ `spec.ingress[].from`**：白名單清單，列出「誰可以連進來」。清單裡**同一個 `from` 項目底下如果同時寫 `podSelector` 又寫 `namespaceSelector`，兩者是「且」（AND）的關係**（必須同時符合）；但清單裡**不同的項目（陣列裡不同的 element）之間是「或」（OR）的關係**——上面範例的 `front`、`db` 各自是獨立的 `podSelector`，符合任一個就放行，這就是 OR 的寫法。
+- **④ `spec.egress[].to`**：跟 `ingress[].from` 對稱，決定「這個 Pod 自己能連出去給誰」。
+
+## `from`／`to` 底下三種「對象」寫法
+
+| 寫法 | 意義 | 範例 |
+| --- | --- | --- |
+| `podSelector` | 依標籤選同一個 namespace 內的 Pod | `podSelector: {matchLabels: {app: front}}` |
+| `namespaceSelector` | 依標籤選整個 namespace（該 namespace 底下所有 Pod） | `namespaceSelector: {matchLabels: {env: prod}}` |
+| `ipBlock` | 依 CIDR 網段（通常用在放行 cluster 外部的 IP，例如允許連到外部 API） | `ipBlock: {cidr: 203.0.113.0/24}` |
+
+三者可以在同一個 `from`/`to` 陣列裡混用（每個各自是一個獨立項目、彼此 OR），也可以把 `podSelector` 跟 `namespaceSelector` 寫在同一個項目底下做 AND（例如「只允許 `prod` namespace 裡標籤是 `app: front` 的 Pod」）。
+
+## 一個常被忽略的坑：DNS
+
+**一旦某個 Pod 的 `Egress` 被限制住，連 DNS 查詢（[Day 17](#day-17) 的 `kube-dns`）也會被擋下來**，因為 DNS 查詢本質上也是一種「連出去」的網路流量（打去 `kube-system` namespace 裡的 `kube-dns`/`CoreDNS` Pod，走 UDP/TCP port `53`）。如果 `egress` 規則只寫了「能連 `front`、`db`」，沒有額外放行 DNS，這個 Pod 就會**連 Service 名稱都解析不出來**，就算目標 IP 真的通，程式碼裡用 Service 名稱連線的地方全部會失敗。
+
+實務上常見的搭配寫法：
+
+```yaml
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: front
+    - podSelector:
+        matchLabels:
+          app: db
+  - to:                          # 額外多一條，專門放行 DNS
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+```
+
+[CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 的題目描述沒有特別要求 DNS，練習範例也就沒加這段，但實際考場如果連線測試失敗、明明 IP 直連沒問題，DNS 解析卻失敗，這是很典型的漏放行 DNS 的症狀。
+
+## `NetworkPolicy` 生不生效，要看 CNI 插件
+
+`NetworkPolicy` 本身只是一個 Kubernetes API 物件（yaml 定義規則），**真正負責執行網路隔離的是 CNI（Container Network Interface）插件**，這跟 [Day 19](#day-19) 提過的「`Ingress` 只是規則、`Ingress Controller` 才是真正執行者」是同一種「宣告 vs. 執行」分工模式：
+
+- 支援 `NetworkPolicy` 的 CNI：Calico、Cilium、WeaveNet 等
+- **不支援**的 CNI：像 minikube 預設用的 CNI 就不一定會真的執行隔離規則
+
+也就是說，就算 `NetworkPolicy` 的 yaml 寫得完全正確、`kubectl apply` 也成功，如果 cluster 的 CNI 不支援，Pod 之間該擋的流量還是會照樣通——這是練習 `NetworkPolicy` 時最容易誤判「規則沒生效」的原因，其實是**環境根本沒有東西在執行這個規則**，不是規則寫錯。
+
+## 我的想法
+
+- `NetworkPolicy` 的 `podSelector` 跟 [Day 32](#day-32) RBAC 的 `RoleBinding.subjects` 放在一起看很有意思：**兩者都是「限縮存取範圍」的機制，但選取「對象」的方式完全不同**——RBAC 用明確指名（`ServiceAccount` 名稱）去綁定權限，`NetworkPolicy` 用標籤選取去綁定網路規則。這其實跟 [Day 9](#day-9) Service 的 `selector` 是同一套哲學的延伸：Kubernetes 大量的「規則套用給誰」場景都偏好用 label selector 而不是寫死名稱，好處是 Pod 汰換（例如 Deployment rolling update 產生新 Pod）時規則自動延續，不用每次重新綁定。
+- 「選中就變白名單」這個機制乍看有點反直覺（怎麼「加標籤」這種本來該是中性的動作，會產生限制效果？），但換個角度想，這正是 `NetworkPolicy` 刻意設計成這樣的資安考量：**如果要手動去啟用限制，很容易忘記做；但如果限制是「被規則選中就自動生效」，只要規則本身寫對了，就不會漏掉任何符合條件的 Pod**——[CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)故意設計成「規則已經寫好、只能改 Pod」，也是在考這個「白名單自動觸發」的理解。
+- DNS 這個坑其實跟 [Day 32](#day-32) RBAC 學到的「最小權限原則」互相呼應：**限制流量的人，往往容易忘記系統本身運作也需要一些「看不見」的基礎流量**（RBAC 那邊是 ServiceAccount 需要能讀自己的 token；這邊是 Pod 需要能查 DNS）。設計/除錯這類限制規則時，多想一步「這個 Pod 除了業務邏輯要連的東西，還需要哪些基礎設施層級的存取」，是兩邊都適用的檢查習慣。
+
+## 小結
+
+- Kubernetes 預設網路模型是**全通**（任何 Pod 可以連任何 Pod），`NetworkPolicy` 是用來限制這件事的原生機制，本質是「針對 Pod 的防火牆規則」。
+- 核心心法：**沒被選中的 Pod 完全不受限制；只要被任何 `NetworkPolicy` 的 `podSelector` 選中，對應方向就從「預設允許」變成「白名單制」**，這是由「選中」自動觸發的，不用額外啟用。
+- `ingress`/`egress` 分開管制方向，`from`/`to` 底下可以用 `podSelector`／`namespaceSelector`／`ipBlock` 三種方式指定對象，同一個 peer 項目內是 AND，陣列裡不同項目之間是 OR。
+- **限制 `egress` 時容易忘記放行 DNS**（UDP/TCP port 53 打去 `kube-dns`），漏放行會導致 Service 名稱完全解析不出來，是很典型的踩坑症狀。
+- `NetworkPolicy` 的 yaml 本身只是宣告，**真正執行隔離的是 CNI 插件**，CNI 不支援的話規則不會真的生效，這是排查「規則沒作用」時第一個要確認的環境因素。
+- 對應 [CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)：這題只能改 Pod、不能碰 NetworkPolicy，正是利用「選中即生效」的白名單機制，幫目標 Pod 加上正確標籤即可讓既有規則套用上去。
+
 # CKAD TEST
 
 > 資料來源：CNCF 官方 [CKAD Exam Curriculum](https://github.com/cncf/curriculum)（目前版本 v1.35，對應 Kubernetes 1.35，2026-03-14 發布）
@@ -3461,14 +3581,14 @@ kubectl get deploy webapp -n default -o jsonpath='{.spec.strategy}'
 
 | 知識點 | 內容 | 對應 Day |
 | --- | --- | --- |
-| NetworkPolicies | 網路流量控管規則 | 尚未涉及 |
+| NetworkPolicies | 網路流量控管規則 | [Day 34](#day-34)（`podSelector` 白名單機制、`ingress`/`egress` 方向管制、`podSelector`/`namespaceSelector`/`ipBlock` 三種對象寫法、DNS egress 常見踩坑、CNI 插件才是真正執行者） |
 | 建立與除錯 Service 存取 | 透過 Service 曝露應用、排除連線問題 | [Day 5](#day5)（`kubectl expose`、NodePort、Port Mapping 架構圖）、[Day 6](#day-6)（kube-proxy / iptables 如何決定流量轉發）、[Day 9](#day-9)（Service YAML 完整欄位、`ClusterIP`/`NodePort`/`LoadBalancer` 三種類型、Dynamic Cluster IP、NodePort Range 限制）、[Day 10](#day-10)（Service 的 `selector` 底層就是 Labels 篩選機制）、[Day 13](#day-13)（`containerPort`/`targetPort`/`port`/`nodePort` 四層 port 完整對照，是 Service 連線除錯最常見的考點）、[Day 17](#day-17)（`kube-dns`：Pod 之間透過 Service 名稱互相溝通，不受 Cluster IP 動態變動影響） |
 | Ingress | 對外路由規則 | [Day 19](#day-19)（Ingress 依路徑/domain name 導流、SSL termination、Ingress Controller 實現負載平衡） |
 
 ## 小結
 
 - 已涵蓋：workload resource 概念（Day 7 Replication Controller、Day 8 Replica Set / Deployment）、Deployment 的 rollout / rollback（Day 8）、Service 完整概念與三種類型（Day 5、Day 6、Day 9）、DNS-based Service Discovery（Day 17 `kube-dns`）、基本 CLI 監控指令、Probes / health checks 的 `livenessProbe`（Day 11，尚缺 readiness／startup probe）、Secrets 基本建立與掛載方式（Day 12，尚缺 Service Account 限制存取）、ConfigMaps（Day 18）、Ingress / Ingress Controller（Day 19）、Volumes 基本類型與掛載機制（Day 20）、`StorageClass`/`PersistentVolumeClaim` 動態產生 Volume（Day 21）、Stateful Wordpress 實際部署 + `initContainer` 範例（Day 22）、`resources.requests` 與 HorizontalPodAutoscaler 概念（Day 25，尚缺 `limits`）、Namespaces 與 `ResourceQuota` 實際部署驗證（Day 27）、`StatefulSet` 概念與 `volumeClaimTemplates`（Day 31，原教學系列沒教、自行補充）、`ServiceAccount` 與 RBAC `Role`/`RoleBinding` 實際部署驗證（Day 32，原教學系列沒教、自行補充）、`RollingUpdate` 策略深入（`maxSurge`/`maxUnavailable` 運作機制與進位規則、實測驗證 `rollout undo` 不會還原 `strategy`）（Day 33，原教學系列沒教、自行補充）。
-- Services and Networking 這個 Domain（20%）目前只剩 `NetworkPolicies` 尚未涉及，其餘知識點已有不錯的覆蓋。
+- `Services and Networking` 這個 Domain（20%）目前**三個知識點全部涵蓋**：`建立與除錯 Service 存取`（Day 5/6/9/10/13/17）、`Ingress`（Day 19）、`NetworkPolicies`（Day 34，原教學系列沒教、自行補充）。
 - **Day 10 補充說明**：Labels / Selector 是貫穿多個考點的底層機制（workload resource 的 `selector`、Service 的 `selector` 都靠它），本身不是獨立的考綱條目，但值得作為理解其他考點的基礎；而 `nodeSelector`（Pod 排程到特定 Node）**不在目前 CKAD 官方考綱的 5 大 Domain 內**，比較屬於 CKA 的範疇，準備 CKAD 可以降低這部分的優先度。
 - **Day 13 補充說明**：「搞懂 Service Port / Pod Port / targetPort / nodePort」這節整理的四層 port 對照，是 CKAD 考古題裡多次出現的基礎知識——例如 [CKAD-Prepare.md 題目9](CKAD-Prepare.md#題目9---建立-deployment-並指定環境變數) 就實際碰到「`containerPort` 只是容器監聽 port 的宣告、不等於 Service 會自動轉發過去」這個常見誤解；核心心法是**同一個字「port」在四個不同層級各自代表不同東西**，`targetPort` 才是真正連結 Service 跟 Pod 實際監聽 port 的欄位，`containerPort` 更接近文件用途。
 - **Day 18 補充說明**：ConfigMap 與 [Day 12](#day-12) Secret 是同一套掛載機制（`volumes` + `volumeMounts`），差別在機密／非機密資料，考試時容易混淆兩者該用哪一個，記住「機密用 Secret、非機密部署配置用 ConfigMap」即可。
@@ -3481,4 +3601,5 @@ kubectl get deploy webapp -n default -o jsonpath='{.spec.strategy}'
 - **Day 31 補充說明**：`StatefulSet` 是這系列筆記原文完全沒教、自行補充的內容，補上的是 `Choose and use the right workload resource` 這個知識點裡「多 replica 的 stateful 應用」這一塊；只整理概念與 yaml 範例，沒有像 [Day 22](#day-22)/[Day 25](#day-25)/[Day 27](#day-27) 那樣實際部署驗證，`DaemonSet`／`CronJob` 這兩個同一知識點下的其他 workload 類型也還沒涉及。
 - **Day 32 補充說明**：`ServiceAccount` 與 RBAC（`Role`/`RoleBinding`）是這系列筆記原文完全沒教、因準備 CKAD 考古題（[CKAD-Prepare.md 題目10](CKAD-Prepare.md#題目10---rbac-授權除錯serviceaccount-權限不足)）實際踩到 `Forbidden` 錯誤才回頭補充的內容，一次補齊 `ServiceAccounts` 跟 `Authentication / Authorization / Admission Control` 兩個知識點裡的 Authentication／Authorization 部分（`Admission Control` 仍待補），而且是已經在本機 minikube 實際部署、重現錯誤、再修復驗證成功的，不是只停留在概念層面。
 - **Day 33 補充說明**：`RollingUpdate` 的 `maxSurge`/`maxUnavailable` 運作機制是 [Day 8](#day-8) 只用兩句話帶過、沒深入解釋的部分，因準備 [CKAD-Prepare.md 題目15](CKAD-Prepare.md#題目15---deployment-升級策略更新與回滾) 實測「設定策略 → 更新 → 回滾」整個流程時，親手發現 `kubectl rollout undo` 只回滾 `spec.template`、完全不會還原 `spec.strategy` 這個 Day 8 沒提過的細節，才回頭把百分比進位規則、Pod 數量浮動時間軸一起整理清楚；屬於 `Deployment 與 rolling update` 這個既有知識點的深化，不是新知識點。
-- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）、`ServiceAccounts`／RBAC（Day 32）五塊，其餘 CRD/Operators、`Admission Control`、`SecurityContexts` 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe、NetworkPolicies 等，是後續應優先加強的重點。
+- **Day 34 補充說明**：`NetworkPolicy` 是這系列筆記原文完全沒教、因準備 [CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 才回頭補充的內容，一次補齊 `Services and Networking` 這個 Domain（20%）裡最後一塊「尚未涉及」的知識點，讓這個 Domain 首次達到全部涵蓋；核心是「選中即白名單」這個容易反直覺的機制，以及 DNS egress、CNI 插件支援度這兩個實務除錯時最容易忽略的環節。
+- 佔分最重（25%）的 Environment/Config/Security Domain 目前已有 Secrets（Day 12）、ConfigMaps（Day 18）、`resources.requests`（Day 25）、`ResourceQuota`（Day 27）、`ServiceAccounts`／RBAC（Day 32）五塊，其餘 CRD/Operators、`Admission Control`、`SecurityContexts` 仍尚未涉及，加上部署策略（blue/green、canary）、Helm、Kustomize、readiness/startup probe 等，是後續應優先加強的重點。

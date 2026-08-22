@@ -1,0 +1,61 @@
+# 模擬考場既有狀態（環境設定用，不是這題要改的對象）：
+# namespace ckad00018 已經有 front、db 兩個 Pod，以及一條符合題目需求的 NetworkPolicy。
+# ⚠️ 這份檔案僅供環境模擬／參考，實際考試「不能」create/modify/delete NetworkPolicy，
+#    這裡列出來只是方便自己練習時知道 podSelector 長什麼樣子，判斷該幫 Pod 加什麼標籤。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ckad00018
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: front
+  namespace: ckad00018
+  labels:
+    app: front
+spec:
+  containers:
+  - name: nginx
+    image: nginx:stable
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+  namespace: ckad00018
+  labels:
+    app: db
+spec:
+  containers:
+  - name: nginx
+    image: nginx:stable
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-front-db-only
+  namespace: ckad00018
+spec:
+  podSelector:
+    matchLabels:
+      role: restricted        # ← 這是關鍵：ckad00018-newpod 要加上這個標籤才會被這條 NetworkPolicy 套用
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: front
+    - podSelector:
+        matchLabels:
+          app: db
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: front
+    - podSelector:
+        matchLabels:
+          app: db
