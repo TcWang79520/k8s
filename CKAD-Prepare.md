@@ -27,6 +27,7 @@
 - `kubectl config use-context k8s`：切換到指定 context（範例用 `k8s`）
 - `kubectl config set-context k8s --namespace=pod-resource`
 - `kubectl get pods -A`：撈出**所有 namespace** 的 Pod（`-A`/`--all-namespaces`），題目沒指定或說「可能在任何 namespace」時的第一步（見 [題目13](#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod)）；同樣的 `-A` 也能加在 `get events`/`get deploy` 等其他資源上，不是 `get pods` 專屬
+- `kubectl get pods -n <namespace> --show-labels`：一次列出該 namespace 底下每個 Pod 目前的所有標籤，不用一個一個 `kubectl get pod <name> -o yaml` 慢慢翻——凡是題目牽涉到 label selector（Service、NetworkPolicy、Deployment selector）的情境，這是確認「現在標籤長怎樣」最快的指令，[題目17](#題目17---更新-deployment-並暴露-service)/[題目18](#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 都用得到
 - （未來陸續補充的通用指令都放這裡）
 
 ### 修改既有物件：優先用「匯出 → 編輯 → apply」，少用 `kubectl edit`
@@ -1364,31 +1365,35 @@ minikube service rover -n ckad00017 --url
 
 **相關資源**：
 
-- [CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml)——**僅供環境模擬／參考**，模擬考場已經存在的 `front`/`db` Pod 跟 NetworkPolicy 本身（`podSelector: {role: restricted}`），練習時只是拿來確認 selector 長什麼樣子，**不是這題要交出去的答案**
-- [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml)——**這題唯一該修改的物件**，只加了 `role: restricted` 這個標籤
+- [CKAD/18-build-env.yaml](CKAD/18-build-env.yaml)——環境模擬用，`ckad00018` namespace + `front`/`db` 兩個 Pod（`app: front`/`app: db`）
+- [CKAD/18-networkpolicy.yaml](CKAD/18-networkpolicy.yaml)——**僅供環境模擬／參考**，模擬考場已經存在的兩條 NetworkPolicy，**不是這題要交出去的答案**：
+  - `db-front`：管制 `app: db` 這個 Pod，只放行帶有 `db-access: "true"` 標籤的對象
+  - `access-front`：管制 `app: front` 這個 Pod，只放行帶有 `front-access: "true"` 標籤的對象
+- [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml)——**這題唯一該修改的物件**，要同時加上 `front-access: "true"` 跟 `db-access: "true"` 兩個標籤
 
-> 這兩份 yaml 目前**只是先寫好**，還沒在本機 minikube 套用驗證（使用者要求先不要執行 `kubectl apply`）。
+> 已在本機 minikube 完整套用並實測驗證（含正向連線測試 + 意外發現的 CNI 未強制執行問題，見下方踩坑筆記）。
 
-**解法指令**（尚未執行，供之後練習/驗證參考）：
+**這題的關鍵推理，跟原本以為的不太一樣**：一開始以為會有一條「專門管 `ckad00018-newpod`」的 NetworkPolicy，但實際環境是**反過來的設計**——`front`、`db` 各自有一條 NetworkPolicy 管制「誰可以連自己」，`ckad00018-newpod` 本身完全沒有專屬規則。所以 `newpod` 要跟 `db` 通，靠的是滿足 `db-front` 這條規則的 `db-access: "true"`；要跟 `front` 通，靠的是滿足 `access-front` 這條規則的 `front-access: "true"`——**兩個目標各自對應一條規則、各自要求一個標籤，兩個都要加，缺一個就只能通一邊**。
+
+**解法指令**（已實測跑過整個流程）：
 
 ```bash
 kubectl config use-context nk8s
 
-# 1. 先查清楚 namespace 裡有哪些既有的 NetworkPolicy，看它的 podSelector 長什麼樣
+# 1. 先查清楚 namespace 裡有哪些既有的 NetworkPolicy，看它們各自的 podSelector 管的是誰
 kubectl get networkpolicy -n ckad00018
-kubectl describe networkpolicy -n ckad00018
-# 或直接看完整 yaml，確認 podSelector 的 key/value
+# NAME           POD-SELECTOR   AGE
+# access-front   app=front      ...
+# db-front       app=db         ...
 kubectl get networkpolicy -n ckad00018 -o yaml
+# 確認 access-front 要求 front-access: "true"、db-front 要求 db-access: "true"
 
-# 2. 確認 ckad00018-newpod「現在」的標籤，跟 NetworkPolicy 的 podSelector 對照，看差在哪個 key
+# 2. 確認 ckad00018-newpod「現在」的標籤
 kubectl get pod ckad00018-newpod -n ckad00018 --show-labels
 
-# 3. 只補上 NetworkPolicy 需要的標籤（不要動其他東西，尤其不要動 NetworkPolicy 本身）
-kubectl label pod ckad00018-newpod -n ckad00018 role=restricted
-# 或用「匯出 → 編輯 → apply」：
-kubectl get pod ckad00018-newpod -n ckad00018 -o yaml > 18-ckad00018-newpod.yaml
-# 編輯 18-ckad00018-newpod.yaml，在 metadata.labels 補上 role: restricted
-kubectl apply -f 18-ckad00018-newpod.yaml
+# 3. 補上兩個 NetworkPolicy 各自要求的標籤（記得帶 Pod 名稱！）
+kubectl label pod ckad00018-newpod -n ckad00018 front-access=true
+kubectl label pod ckad00018-newpod -n ckad00018 db-access=true
 ```
 
 `CKAD/18-ckad00018-newpod.yaml` 關鍵欄位：
@@ -1398,23 +1403,27 @@ metadata:
   name: ckad00018-newpod
   namespace: ckad00018
   labels:
-    role: restricted   # 這是唯一需要加的東西，對到 NetworkPolicy 的 podSelector
+    front-access: "true"   # 對到 access-front 這條規則
+    db-access: "true"      # 對到 db-front 這條規則
 ```
 
-**驗證**（等實際套用後再執行）：
+**驗證**（已實測）：
 
 ```bash
 kubectl get pod ckad00018-newpod -n ckad00018 --show-labels
-# labels 應該包含 role=restricted
+# labels 應該同時有 front-access=true, db-access=true
 
-# 確認 NetworkPolicy 現在真的有選中這個 Pod
-kubectl describe networkpolicy allow-front-db-only -n ckad00018
-# 底下應該能看到符合 role=restricted 的 Pod 被列入套用範圍
+# 正向連線測試：newpod 連 front、db 都應該通
+FRONT_IP=$(kubectl get pod front -n ckad00018 -o jsonpath='{.status.podIP}')
+DB_IP=$(kubectl get pod db -n ckad00018 -o jsonpath='{.status.podIP}')
+kubectl exec ckad00018-newpod -n ckad00018 -- curl -s -m 4 -o /dev/null -w "HTTP %{http_code}\n" http://$FRONT_IP
+kubectl exec ckad00018-newpod -n ckad00018 -- curl -s -m 4 -o /dev/null -w "HTTP %{http_code}\n" http://$DB_IP
+# 兩個都應該是 HTTP 200
 
-# 實際連線測試（需要三個 Pod 都在跑）：
-# 從 ckad00018-newpod 連 front/db 應該通，連其他任意第三方 Pod 應該不通
-kubectl exec ckad00018-newpod -n ckad00018 -- curl -m 3 <front的PodIP>
-kubectl exec ckad00018-newpod -n ckad00018 -- curl -m 3 <其他Pod的PodIP>   # 應該逾時/不通
+# 反向測試：沒有 front-access 標籤的第三方 Pod，理論上應該連不到 front
+kubectl run outsider -n ckad00018 --image=curlimages/curl --restart=Never -- sleep 3600
+kubectl exec outsider -n ckad00018 -- curl -s -m 4 -o /dev/null -w "HTTP %{http_code}\n" http://$FRONT_IP
+kubectl delete pod outsider -n ckad00018
 ```
 
 **對應考綱 Domain**：
@@ -1423,9 +1432,11 @@ kubectl exec ckad00018-newpod -n ckad00018 -- curl -m 3 <其他Pod的PodIP>   # 
 
 **易錯點／踩坑筆記**：
 
-- **NetworkPolicy 不是「指定 Pod 名稱」去管控，而是透過 `podSelector`（label selector）去選中一群 Pod**，這是這題最核心的觀念：題目給的三個角色（`ckad00018-newpod`/`front`/`db`）在 NetworkPolicy 的 yaml 裡完全不會用名稱出現，只會看到 `matchLabels`——這也是為什麼題目可以合理要求「不能碰 NetworkPolicy，只能改 Pod」：因為規則早就用標籤定義好了，缺的只是「哪些 Pod 符合這個標籤」
-- **題目故意設計成「已經有現成規則，只是東西沒對上」的情境**，這種題型的正確思路是**先讀規則、再補資料**，不是憑感覺亂猜——一定要先 `kubectl get networkpolicy -o yaml` 把 `podSelector`/`ingress[].from`/`egress[].to` 全部看過一遍，搞清楚哪個 label key/value 才是缺的那一塊，再對症下藥去改 Pod
-- `NetworkPolicy` 的 `ingress`（誰可以連進來）跟 `egress`（自己可以連出去給誰）**是分開控制的兩個方向**，題目說「只與 `front`、`db` 收發流量」（收＝ingress、發＝egress）代表兩個方向都要被限制在這兩個對象內——[CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml) 練習範例裡 `ingress`/`egress` 各自都寫了對應 `front`/`db` 的 `podSelector`，policyTypes 也要同時列出 `Ingress`、`Egress`，只寫一半會漏掉一個方向的限制
-- **一旦 `NetworkPolicy.spec.podSelector` 選中了某個 Pod，那個 Pod 在對應方向（Ingress/Egress）就會從「預設全開放」變成「預設全封鎖，只有規則允許的才通」**——這是 Kubernetes NetworkPolicy 的白名單機制：沒有任何 NetworkPolicy 選中的 Pod 預設暢通無阻，一旦被選中（不管透過哪一條規則），就必須有規則明確允許才放行，這也是為什麼幫 `ckad00018-newpod` 加上標籤這個動作本身就會產生限制效果，不用另外做什麼「啟用」的步驟
-- **NetworkPolicy 生效與否要靠 CNI 插件實作**（不是所有 CNI 都支援，minikube 預設的 CNI 不一定支援 NetworkPolicy）：練習時如果 `kubectl apply` 都成功、標籤也對了，但實際連線測試 `ingress`/`egress` 限制沒有生效，先確認 cluster 用的 CNI 支不支援 NetworkPolicy（例如 minikube 需要額外用 `--cni=calico` 這類參數啟用支援 NetworkPolicy 的網路插件，預設的 CNI 不一定會真的執行隔離）
-- 這兩份 yaml 目前**只是寫好、還沒套用驗證**（使用者要求先不要執行 `kubectl apply`），[CKAD/18-networkpolicy-existing.yaml](CKAD/18-networkpolicy-existing.yaml) 只是我方便你練習時參考「NetworkPolicy 長怎樣」用的環境模擬檔，**不是**這題要交的答案——這題真正的答案只有 [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml) 這一份，考試時千萬別誤把心力花在改 NetworkPolicy 上，題目已經明確警告不能動它
+- **NetworkPolicy 不是「指定 Pod 名稱」去管控，而是透過 `podSelector`（label selector）去選中一群 Pod**，這是這題最核心的觀念：`front`、`db`、`ckad00018-newpod` 三個角色的名稱完全不會出現在 NetworkPolicy 的 yaml 裡，只會看到 `matchLabels`——這也是為什麼題目可以合理要求「不能碰 NetworkPolicy，只能改 Pod」：規則早就用標籤定義好了，缺的只是「哪些 Pod 符合這個標籤」
+- **規則可能是「掛在對方身上」，不是「掛在自己身上」**：這題一開始容易誤以為要找一條專門管 `ckad00018-newpod` 的 NetworkPolicy，但實際環境是 `db-front`（管 `app: db`）、`access-front`（管 `app: front`）各自獨立管制「誰可以連我」，`newpod` 完全沒有專屬規則——`newpod` 要做的是**滿足對方規則裡對「訪客」的標籤要求**，而不是找一條寫著自己名字的規則。讀題時如果只找「跟 `newpod` 有關」的規則會找不到重點，正確做法是找「跟 `front`/`db` 有關」的規則，看它們各自要求訪客帶什麼標籤
+- **兩個目標（`front`、`db`）各自對應一條獨立規則，兩個標籤都要加，不是加一個就兩邊都通**：`db-front` 只認 `db-access: "true"`，`access-front` 只認 `front-access: "true"`，這是兩條互相獨立的規則，`newpod` 要兩個目標都連得到，兩個標籤缺一不可——這跟原本猜測「一條規則、一個標籤」的簡化情境不同，實際環境比較貼近真實場景：每個服務自己管自己的存取名單，而不是有一個中央規則管全部人
+- `kubectl label pod -n ckad00018 front-access=true` 這種寫法**漏了 Pod 名稱**，實測會直接報錯 `error: resource(s) were provided, but no name was specified`——`kubectl label` 的正確語法是 `kubectl label <resource-type> <resource-name> -n <namespace> <key>=<value>`，資源名稱是必填，不能只給 namespace
+- `NetworkPolicy` 的 `ingress`（誰可以連進來）跟 `egress`（自己可以連出去給誰）**是分開控制的兩個方向**，這題兩條規則都同時列了 `Ingress`、`Egress`，也各自在兩個方向都寫了同樣的標籤條件——只寫一半會漏掉一個方向的限制
+- **一旦 `NetworkPolicy.spec.podSelector` 選中了某個 Pod，那個 Pod 在對應方向就會從「預設全開放」變成「預設全封鎖，只有規則允許的才通」**——這是白名單機制，加標籤這個動作本身就會產生限制效果，不用另外「啟用」
+- **重要實測結果：這個 minikube 環境的 NetworkPolicy 完全沒有被強制執行**——標籤、規則都設定正確，`newpod` 加標籤前後連線都是 `HTTP 200`；額外測試一個完全沒有 `front-access` 標籤的第三方 Pod（`outsider`）去連 `front`，**結果同樣是 `HTTP 200`，理論上應該被擋下來卻沒有**。檢查 `kube-system` 底下沒有 Calico/Cilium/Weave 這類支援 NetworkPolicy 的 CNI 插件，證實這個環境用的是不支援 NetworkPolicy 的預設 CNI——**`kubectl apply` 成功、`kubectl get networkpolicy` 也能查到規則，不代表規則真的有在擋流量**，這是本機練習環境的限制，跟 yaml 寫得對不對無關；實際 CKAD 考場的沙盒環境通常會配置支援 NetworkPolicy 的 CNI（不然這類考題就沒有意義了），但本機練習如果看到「規則設定正確、連線卻還是全部打通」，不要自我懷疑 yaml 哪裡寫錯，先確認 CNI 支援度
+- [CKAD/18-networkpolicy.yaml](CKAD/18-networkpolicy.yaml) 只是環境模擬用的參考檔，**不是**這題要交的答案——這題真正的答案只有 [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml) 這一份，考試時千萬別誤把心力花在改 NetworkPolicy 上，題目已經明確警告不能動它

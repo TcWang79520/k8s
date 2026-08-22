@@ -1,5 +1,6 @@
 # 這題唯一該修改的物件：ckad00018-newpod
-# 只加上 role: restricted 這個標籤，讓它被既有的 NetworkPolicy（allow-front-db-only）選中，
+# db、front 各自有一條 NetworkPolicy，只放行帶有 db-access=true / front-access=true
+# 標籤的對象，所以 newpod 要「兩個標籤都加」才能同時跟 db、front 收發流量。
 # 不新建、不修改、不刪除任何 NetworkPolicy。
 apiVersion: v1
 kind: Pod
@@ -7,7 +8,8 @@ metadata:
   name: ckad00018-newpod
   namespace: ckad00018
   labels:
-    role: restricted
+    front-access: "true"
+    db-access: "true"
 spec:
   containers:
   - name: nginx

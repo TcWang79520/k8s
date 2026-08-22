@@ -3505,6 +3505,8 @@ spec:
 
 也就是說，就算 `NetworkPolicy` 的 yaml 寫得完全正確、`kubectl apply` 也成功，如果 cluster 的 CNI 不支援，Pod 之間該擋的流量還是會照樣通——這是練習 `NetworkPolicy` 時最容易誤判「規則沒生效」的原因，其實是**環境根本沒有東西在執行這個規則**，不是規則寫錯。
 
+**這件事在 [CKAD-Prepare.md 題目18](CKAD-Prepare.md#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊) 的練習環境裡被親手驗證出來過**：標籤、`podSelector`、`ingress`/`egress` 規則全部設定正確，正向測試（該通的）通過；但額外測試一個**完全不符合規則要求標籤**的第三方 Pod 去連應該被擋下的目標，結果依然是 `HTTP 200`——檢查 `kube-system` 底下果然沒有 Calico/Cilium/Weave 這類 CNI，證實這個 minikube 環境用的預設 CNI 真的不執行 NetworkPolicy 隔離。這個結果很好地示範了「規則設定對」跟「規則真的有作用」是兩件要分開驗證的事，不能只看 `kubectl apply` 有沒有報錯。
+
 ## 我的想法
 
 - `NetworkPolicy` 的 `podSelector` 跟 [Day 32](#day-32) RBAC 的 `RoleBinding.subjects` 放在一起看很有意思：**兩者都是「限縮存取範圍」的機制，但選取「對象」的方式完全不同**——RBAC 用明確指名（`ServiceAccount` 名稱）去綁定權限，`NetworkPolicy` 用標籤選取去綁定網路規則。這其實跟 [Day 9](#day-9) Service 的 `selector` 是同一套哲學的延伸：Kubernetes 大量的「規則套用給誰」場景都偏好用 label selector 而不是寫死名稱，好處是 Pod 汰換（例如 Deployment rolling update 產生新 Pod）時規則自動延續，不用每次重新綁定。
