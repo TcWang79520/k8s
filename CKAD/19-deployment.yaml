@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-dm
+  namespace: ingress-ckad
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: nginx-ing
+  template:
+    metadata:
+      labels:
+        name: nginx-ing
+    spec:
+      containers:
+      - name: nginx
+        image: vicuu/nginx:hello81
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 81

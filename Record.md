@@ -1924,6 +1924,54 @@ $ minikube ip
    Pod: helloworld-pod（containerPort 3000）
 ```
 
+## 補充：完整請求路徑（Ingress Controller → Service → NetworkPolicy → Pod）
+
+上面「關係圖」只畫到 Ingress Controller 依規則轉發到 Service，這裡把整條路徑補完整，串起 [Day 13](#day-13) 的 Service port 對照跟 [Day 34](#day-34) 的 NetworkPolicy，看清楚一個外部請求實際會經過哪幾層檢查：
+
+```
+[ 外部使用者 Client ]
+        │  (HTTP / HTTPS 請求)
+        ▼
+┌────────────────────────────────────────────────────────┐
+│ 1. Ingress Controller (例如 Nginx Ingress)               │
+│    • 作用層級：L7 (HTTP/HTTPS)                            │
+│    • 功能：檢查 Host / URL Path、卸載 SSL、路由分流        │
+└────────────────────────────────────────────────────────┘
+        │
+        │  (解析出目標 Service:Port，決定轉發給後端 Pod)
+        ▼
+┌────────────────────────────────────────────────────────┐
+│ 2. Kubernetes Service / Kube-Proxy                       │
+│    • 作用層級：L4 (TCP/UDP)                               │
+│    • 功能：負載均衡 (ClusterIP)，取得目標 Pod IP:Port      │
+└────────────────────────────────────────────────────────┘
+        │
+        │  (流量抵達目標 Pod 所在的 Node 虛擬網卡)
+        ▼
+┌────────────────────────────────────────────────────────┐
+│ 3. NetworkPolicy 檢查點 (由 CNI 如 Calico/Cilium 執行)     │
+│    • 作用層級：L3/L4 防火牆                                │
+│    • 檢查：來源 IP / Pod 標籤 / 端口是否符合 Ingress 規則   │
+└─────────────┬────────────────────────────┬─────────────┘
+              │ (符合白名單)               │ (不符規則)
+              ▼                            ▼
+   ┌──────────────────────┐       ┌──────────────────────┐
+   │ 4. 目標 Pod (Container) │       │ ❌ 直接丟棄 (Drop)    │
+   │    處理業務邏輯並回應   │       │    連線超時 Timeout   │
+   └──────────────────────┘       └──────────────────────┘
+```
+
+**跟前面幾天內容的對照**：
+
+| 圖中步驟 | 對應筆記 | 關鍵欄位/概念 |
+| --- | --- | --- |
+| ① Ingress Controller | [Day 19](#day-19) 本篇 | `Ingress.spec.rules`（host/path）、SSL termination |
+| ② Service / kube-proxy | [Day 9](#day-9)/[Day 13](#day-13) | `port`/`targetPort`、`ClusterIP` |
+| ③ NetworkPolicy 檢查點 | [Day 34](#day-34) | `podSelector`、`ingress[].from`、CNI 插件執行 |
+| ④ Pod | [Day 6](#day-6) | container 實際監聽的 port（`containerPort`） |
+
+**一個要修正的簡化之處**：這張圖把②③畫成兩個先後分開的步驟（先查 Service 拿到 Pod IP，再過 NetworkPolicy 檢查），概念上方便理解，但實務上 **Nginx Ingress Controller 通常不是真的先查 ClusterIP 再轉發**——它會直接 watch Kubernetes 的 `Endpoints`/`EndpointSlice`，自己算出後端 Pod IP 清單，直接把流量送到 Pod，略過 kube-proxy 那層 `ClusterIP` 轉發（這樣可以少一層轉發、效能更好）。所以圖裡的②比較適合理解成「Ingress Controller 是靠 Service 的 selector 找到有哪些 Pod」，不是「流量真的先流經 ClusterIP 才轉去 Pod」。③ NetworkPolicy 的檢查則不管流量走哪條路徑，只要封包到達 Pod 所在 Node、要進入 Pod 的網路命名空間之前，CNI 都會依規則做 Ingress 方向的檢查，這一步的先後順序畫法沒有問題。
+
 ## 我的想法
 
 - 這天解決的是 [Day 9](#day-9) NodePort 疊層關係圖裡最外層的痛點：NodePort 讓每個 Service 都要在 Node 上單獨佔一個實體 port（30000~32767 範圍內），Service 一多，port 管理跟防火牆規則就跟著爆炸。Ingress 把這個問題收斂成「只開一個入口，規則寫在 yaml 裡」，是**管理面**的優化，不是取代 Service——最終流量還是會落到 Service → Pod 這條路徑上（見上圖）。
@@ -1938,6 +1986,7 @@ $ minikube ip
 - Ingress Controller 目前仍有一些已知 issue，正式導入前建議先詳讀官方 README。
 - **API 版本勘誤**：本篇所有 Ingress yaml 已從原文的 `extensions/v1beta1` 更新為現行的 `networking.k8s.io/v1`（`backend.serviceName/servicePort` → `backend.service.name/port.number`，並新增必填的 `pathType`），可對照 [`demo-ingress/ingress-example-1.yaml`](demo-ingress/ingress-example-1.yaml) 驗證。
 - **安裝方式勘誤**：原文手動 `curl` 拆開的多個 ingress-nginx 部署 yaml（`namespace.yaml`/`default-backend.yaml`/`configmap.yaml`/`without-rbac.yaml`⋯）路徑已全數失效，官方已整併成單一安裝檔。這份筆記的環境（minikube）改用 `minikube addons enable ingress` 一行指令安裝，等同於裝好最新版的 Ingress Controller、ConfigMap、Service、RBAC。
+- **補充（見上方完整請求路徑）**：一個外部請求實際會依序經過 Ingress Controller（L7，[Day 19](#day-19) 本篇）→ Service/kube-proxy（L4，[Day 9](#day-9)/[Day 13](#day-13)）→ NetworkPolicy 檢查點（CNI，[Day 34](#day-34)）才到達 Pod，這張圖把原本分散在三天筆記裡的概念串成一條完整路徑；要注意 Nginx Ingress Controller 實務上通常直接 watch `Endpoints` 轉發給 Pod，不一定真的先經過 `ClusterIP` 那層轉發。
 
 # Day 20
 

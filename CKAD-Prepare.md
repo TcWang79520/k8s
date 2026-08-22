@@ -20,6 +20,7 @@
 - [題目16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA](#題目16---serviceaccount-命名規則禁止自動掛載-token清理未使用的-sa)
 - [題目17 - 更新 Deployment 並暴露 Service](#題目17---更新-deployment-並暴露-service)
 - [題目18 - 用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊](#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊)
+- [題目19 - Ingress 排錯-1](#題目19---ingress-排錯-1)
 
 ## 公用知識
 
@@ -1440,3 +1441,101 @@ kubectl delete pod outsider -n ckad00018
 - **一旦 `NetworkPolicy.spec.podSelector` 選中了某個 Pod，那個 Pod 在對應方向就會從「預設全開放」變成「預設全封鎖，只有規則允許的才通」**——這是白名單機制，加標籤這個動作本身就會產生限制效果，不用另外「啟用」
 - **重要實測結果：這個 minikube 環境的 NetworkPolicy 完全沒有被強制執行**——標籤、規則都設定正確，`newpod` 加標籤前後連線都是 `HTTP 200`；額外測試一個完全沒有 `front-access` 標籤的第三方 Pod（`outsider`）去連 `front`，**結果同樣是 `HTTP 200`，理論上應該被擋下來卻沒有**。檢查 `kube-system` 底下沒有 Calico/Cilium/Weave 這類支援 NetworkPolicy 的 CNI 插件，證實這個環境用的是不支援 NetworkPolicy 的預設 CNI——**`kubectl apply` 成功、`kubectl get networkpolicy` 也能查到規則，不代表規則真的有在擋流量**，這是本機練習環境的限制，跟 yaml 寫得對不對無關；實際 CKAD 考場的沙盒環境通常會配置支援 NetworkPolicy 的 CNI（不然這類考題就沒有意義了），但本機練習如果看到「規則設定正確、連線卻還是全部打通」，不要自我懷疑 yaml 哪裡寫錯，先確認 CNI 支援度
 - [CKAD/18-networkpolicy.yaml](CKAD/18-networkpolicy.yaml) 只是環境模擬用的參考檔，**不是**這題要交的答案——這題真正的答案只有 [CKAD/18-ckad00018-newpod.yaml](CKAD/18-ckad00018-newpod.yaml) 這一份，考試時千萬別誤把心力花在改 NetworkPolicy 上，題目已經明確警告不能動它
+
+## 題目19 - Ingress 排錯-1
+
+**備註（原題）**：`svc` 的 `targetPort` 對應 `deployment` 的 `containerPort`。
+
+**Quick Reference**：
+
+- Cluster/配置環境：`k8s`
+- Namespace：`ingress-ckad`
+
+**題目敘述**：
+
+> ⚠️ 必須先切換到正確的 Cluster/配置環境（`kubectl config use-context k8s`），不這樣做可能導致零分。
+
+在 namespace `ingress-ckad` 下，`deployment`、`service`、`ingress` 三個資源已經部署好了，但配置有問題，導致 Ingress 網路不通。3 個資源的配置清單在目錄 `/ckad/CKAD202206` 中，請修改為正確的，並重新建立。
+
+> ⚠️ 重要注意事項：這題的 **Deployment 是正確的，請不要修改 Deployment**。
+
+**這題的解題範圍**：題目已經明講 Deployment 沒問題，代表**只有 Service、Ingress 兩份檔案要檢查**，不用浪費時間去懷疑 Deployment；備註又提示「`targetPort` 要對應 `containerPort`」，但**實測後發現真正的 bug 不是 `targetPort`，而是 `selector`**——備註是通用提醒（這類 port 對應錯誤很常考），不代表這題唯一的錯誤方向就在那裡，讀提示要小心別被錯誤方向帶偏。
+
+**相關資源**：[CKAD/19-deployment.yaml](CKAD/19-deployment.yaml)（正確，不要修改）、[CKAD/19-service.yaml](CKAD/19-service.yaml)、[CKAD/19-ingress.yaml](CKAD/19-ingress.yaml)——**已在本機 minikube 完整實測並排錯成功**
+
+**真正的 bug 在哪裡**：
+
+```yaml
+# Deployment 的 Pod labels 實際上是：
+labels:
+  name: nginx-ing        # ← key 是 name
+
+# 但 Service 原本寫的 selector 是：
+selector:
+  app: nginx-ing          # ← key 打成 app，跟 Pod 標籤的 key 對不上，完全選不到任何 Pod
+```
+
+`targetPort: 81` 反而是對的——這份 Deployment 用的 `image: vicuu/nginx:hello81` 就是[題目17](#題目17---更新-deployment-並暴露-service)聊過的那個自訂 image，真的監聽在 81，跟 `containerPort: 81` 一致，備註提示在這題其實沒有踩到雷，真正踩雷的是 **selector 的 key 打錯**，`kubectl get endpoints` 顯示 `<none>` 才抓到。
+
+Ingress 額外還有一個**非阻塞性**的疑慮：只用了舊版 annotation `kubernetes.io/ingress.class: "nginx"`，沒有寫新版標準的 `spec.ingressClassName: nginx`。實測查過這個環境的 `ingress-nginx` controller（v1.14.3）啟動參數有 `--watch-ingress-without-class=true`，所以沒設定 class 的 Ingress 一樣會被處理——這題**不影響連線**，但嚴格來說是過時寫法，遇到沒開這個參數的環境就會出問題。
+
+**解法指令**（已實測跑過整個排錯流程）：
+
+```bash
+kubectl config use-context k8s
+
+# 1. 三份資源都看過一輪（Deployment 不用查，題目說是對的）
+kubectl get deploy,svc,ingress -n ingress-ckad
+
+# 2. 對照 Pod 實際標籤 vs Service selector（這一步就抓到 key 打錯）
+kubectl get pods -n ingress-ckad --show-labels
+kubectl get svc nginx-ing-svc -n ingress-ckad -o jsonpath='{.spec.selector}'
+kubectl get endpoints nginx-ing-svc -n ingress-ckad
+# Endpoints 是 <none> → selector 沒選到任何 Pod，這就是真正的 bug
+
+# 3. 修正 Service 的 selector（key 從 app 改成 name），重新套用
+kubectl apply -f CKAD/19-service.yaml
+
+# 4. 再次確認 Endpoints 有進去了
+kubectl get endpoints nginx-ing-svc -n ingress-ckad
+```
+
+`CKAD/19-service.yaml` 修正重點：
+
+```yaml
+spec:
+  selector:
+    name: nginx-ing   # 原本錯寫成 app: nginx-ing，key 對不上 Pod 實際標籤
+```
+
+**驗證**（已實測，兩層都測過）：
+
+```bash
+# 查 Ingress Controller 怎麼對外曝露
+kubectl get svc -n ingress-nginx
+# ingress-nginx-controller 是 NodePort，80:31280/TCP
+
+# 只測 Service（跳過 Ingress，快速排除是不是 Service 本身的問題）
+minikube ssh -- "curl http://10.96.54.242:80"
+# Hello World ^_^ / Port 81
+
+# 測完整 Ingress 路徑（帶題目路徑 /hello）
+minikube ssh -- "curl http://192.168.49.2/hello"
+# Hello World ^_^ / Port 81
+```
+
+兩層都回應 `Hello World ^_^ / Port 81`，確認排錯成功。
+
+**對應考綱 Domain**：
+
+`Services and Networking`（20%）→ `建立與除錯 Service 存取`、`Ingress`（延續 [Record.md Day 19](Record.md#day-19) 的 Ingress 基礎、[Record.md Day 13](Record.md#day-13) 的 port/targetPort 對照，這題把兩者串成一個綜合除錯題）
+
+**易錯點／踩坑筆記**：
+
+- **題目明講「Deployment 是對的、不要動」，這既是提示也是約束**——提示：把檢查範圍縮小到兩份檔案，省時間；約束：就算你懷疑 Deployment 哪裡怪，也不能動它，改了 Deployment 就是不照題目要求，就算意外把服務修通了也可能被扣分
+- **備註提示的方向不一定是這題實際的 bug 所在**：備註寫「`targetPort` 對應 `containerPort`」，這題實測後這個對應關係其實是對的（`81` = `81`），真正的 bug 是 **`selector` 的 key 打錯**（`app` vs `name`）——備註更像是「這類題目常見的檢查項目」提醒，不是「這題唯一的答案」，**不能只顧著查提示提到的那個地方，其他欄位也要照排查順序過一遍**，不然容易漏掉真正的 bug
+- **`Service.spec.selector` 的 key 打錯，不會讓 `kubectl apply` 報錯**，Service 一樣能成功建立，`TYPE`/`PORT(S)` 看起來都正常——因為 selector 只是一個 map，Kubernetes 不會檢查這個 key 是否真的對應到任何 Pod 的標籤。**唯一能抓到這種錯誤的方法是查 `kubectl get endpoints`**，`Endpoints` 是 `<none>` 就代表 selector 沒選到任何東西，這是排查「Service 建立成功但連不通」最關鍵的一步，[題目17](#題目17---更新-deployment-並暴露-service) 也踩過同樣的坑
+- `Ingress.spec.rules[].http.paths[].backend.service.name` 打錯字（或名稱對不上實際的 Service）一樣不會讓 `kubectl apply` 報錯，要用 `kubectl describe ingress` 看 `Backends` 那一欄才抓得到——這題雖然這次沒踩到這個坑（Service 名稱有對上），但排查順序上這是跟 selector 錯誤同一等級、容易被忽略的地方
+- **舊版 `kubernetes.io/ingress.class` annotation vs 新版 `spec.ingressClassName`**：現代 `ingress-nginx`（v1.x）預設只認 `ingressClassName`，除非 controller 有開 `--watch-ingress-without-class=true` 才會相容舊 annotation——這題環境剛好有開，所以沒有造成連線問題，但這是**環境相依**的行為，不是 Ingress 語法本身保證正確，實際考場如果 `kubectl get ingress` 顯示 `CLASS: <none>` 卻連不通，這就是該檢查的方向
+- 排查「Ingress 打不通」的建議順序：① 確認 Deployment 的 Pod 是否 `Running`（這題已知沒問題可跳過）→ ② `kubectl get endpoints <svc>` 確認 Service 有沒有連到 Pod（這題卡在這一步：selector 錯）→ ③ `kubectl describe ingress` 確認 `Backends` 有沒有指到健康的 Service/Pod → ④ 確認 Ingress Controller 本身是否正常運作、有沒有指定 `ingressClassName`
+- **驗證要分層測試**：先測 Service（`curl <ClusterIP>:<port>`）排除是不是 Service 本身的問題，再測完整 Ingress 路徑（打 Ingress Controller 的入口 + 題目指定的路徑），兩層都要從 **`minikube ssh` 內部**測（host 機器打不到 ClusterIP，這是[題目17](#題目17---更新-deployment-並暴露-service)學過的網路範圍限制）；`ingress-nginx` 在 minikube 上除了 `NodePort`，也會直接綁在節點的 80/443（`minikube ip` 那個位址），所以進到 `minikube ssh` 之後直接打 `192.168.49.2/hello` 或 `localhost:31280/hello` 都能測到完整路徑
