@@ -1,2 +1,5 @@
 # CKAD 練習時 build/save 出來的容器 image 產物，不需要版控
 CKAD/ckad/DF/
+
+# Claude Code 本機工具殘留物（worktree、本機權限設定），不需要版控
+.claude/
