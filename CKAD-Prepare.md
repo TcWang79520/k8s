@@ -2,7 +2,7 @@
 
 本文件記錄「CKAD 20 題考古題」教材的練習過程，與 `Record.md`（原教學系列逐日筆記）分開記錄。目前進度：
 
-- [公用知識](#公用知識)
+- [CommonKnowledge](#commonknowledge)
 - [題目1 - CronJob 手動觸發 Job](#題目1---cronjob-手動觸發-job)
 - [題目2 - CronJob 建立（不需手動觸發）](#題目2---cronjob-建立不需手動觸發)
 - [題目3 - 用 Dockerfile 建置並匯出 OCI 格式 image](#題目3---用-dockerfile-建置並匯出-oci-格式-image)
@@ -23,7 +23,7 @@
 - [題目19 - Ingress 排錯-1](#題目19---ingress-排錯-1)
 - [題目20 - Ingress 排錯-2](#題目20---ingress-排錯-2)
 
-## 公用知識
+## CommonKnowledge
 
 - `kubectl config get-contexts`：列出目前 kubeconfig 裡所有可用的 context
 - `kubectl config use-context k8s`：切換到指定 context（範例用 `k8s`）

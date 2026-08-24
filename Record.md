@@ -2301,6 +2301,37 @@ spec:
 > 1. **原文 PVC 範例缺少 `kind: PersistentVolumeClaim`**：原文 `my-persistent-volume-claim.yaml` 只寫了 `apiVersion: v1` 與 `metadata`，漏掉了 `kind` 欄位；YAML 定義檔缺少 `kind` 無法被 `kubectl create` 正確辨識為 PersistentVolumeClaim，上方範例已補上。另外原文說明 PVC 的 `apiVersion` 為 `storage.k8s.io/v1`，這其實是沿用了 Storage Class 段落的說明、貼錯的筆誤——PersistentVolumeClaim 屬於核心 API（`v1`），並非 `storage.k8s.io/v1`（`StorageClass` 才是）。
 > 2. **in-tree AWS EBS provisioner 已淘汰**：跟 [Day 20](#day-20) 的 `awsElasticBlockStore` 一樣，`provisioner: kubernetes.io/aws-ebs` 屬於 in-tree（內建）plugin，自 Kubernetes 1.17 起已 deprecated，1.23 起預設透過 CSI migration 轉譯給 [AWS EBS CSI Driver](https://github.com/kubernetes-sigs/aws-ebs-csi-driver) 處理；較新版本的 Cluster 需額外安裝 `aws-ebs-csi-driver` 這個 add-on 才能運作，若是全新建置的 Cluster，建議直接把 `provisioner` 改成 CSI 原生的 `ebs.csi.aws.com`。
 
+## 整體架構圖：Storage Class → PVC → PV
+
+把今天出現的三個物件（`Pod`、`PersistentVolumeClaim`、`StorageClass`）跟它們動態產生出來的 `PersistentVolume` 畫成一張圖，可以看出這是「開發者視角」與「平台自動化視角」的分工：
+
+```
+[ 開發者視角 ]                              [ 平台自動化／管理員視角 ]
+
+┌───────────────┐
+│      Pod      │
+│  (掛載 PVC)   │
+└───────┬───────┘
+        │ spec.volumes.persistentVolumeClaim.claimName
+        ▼
+┌───────────────┐   ① 請求 (storageClassName)   ┌───────────────────────┐
+│      PVC      │ ───────────────────────────▶ │      StorageClass      │
+│  (我要 8Gi)   │                               │ (provisioner/type/zone │
+│               │                               │    /reclaimPolicy)     │
+└───────┬───────┘                               └───────────┬───────────┘
+        │                                                    │
+        │ ③ 自動綁定 (Bind)                    ② 動態建立 (Provision)
+        ▼                                                    ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                       PersistentVolume (PV)                         │
+│                (實際配置好的 8Gi 儲存空間，例如一顆 AWS EBS)            │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+- 開發者只需要做兩件事：在 `PersistentVolumeClaim` 裡宣告要多大空間（`storage: 8Gi`）、要用哪個 `Storage Class` 模板（`storageClassName: standard`）；再到 `Pod` 裡用 `claimName` 指到這個 PVC，完全不用碰底層雲端服務的細節。
+- ①② 是 Kubernetes 自動完成的：PVC 建立後，會依照 `storageClassName` 指到的 `Storage Class`（`provisioner`/`type`/`zone` 等規格），向底層雲端服務動態建立一顆對應規格的 `PersistentVolume`。
+- ③ 建立完成後，PVC 會自動跟這顆新產生的 PV 綁定（Bind）；Pod 掛載的其實是 PVC，PVC 背後真正對應的儲存空間就是這顆 PV，PV 消失時是否要保留，則交由 `Storage Class` 的 `reclaimPolicy` 決定。
+
 ## 我的想法
 
 - 這篇的核心是把 [Day 20](#day-20) 「手動用 `aws-cli` 建立 Volume、記 `VolumeID`、手動掛載、手動回收」的整套流程自動化：`Storage Class` 負責定義「這類 Volume 長什麼樣子」（模板），`PersistentVolumeClaim` 負責「跟模板要一份資源」（動態產生 + 綁定），Pod 只要引用 PVC 的名字即可，完全不用碰底層雲端服務的細節，這跟 [Day 8](#day-8) Deployment 幫忙管理 Pod、不必手動操作 Replica Set 是類似的「自動化 + 抽象一層」的設計思路。
