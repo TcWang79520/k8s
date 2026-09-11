@@ -7,7 +7,7 @@
 - [Q3 - 建立 Job（alpine 執行 top）](#q3---建立-jobalpine-執行-top)
 - [Q4 - 建立 Pod 並設定自訂 Annotation](#q4---建立-pod-並設定自訂-annotation)
 - [Q6 - Deployment 滾動更新策略與 rollout undo](#q6---deployment-滾動更新策略與-rollout-undo)
-- [Q10 - Service（NodePort/ClusterIP）與 NetworkPolicy](#q10---servicenodeportclusterip-與-networkpolicy)
+- [Q10 - Service（NodePort/ClusterIP）與 NetworkPolicy](#q10---servicenodeportclusterip與-networkpolicy)
 - [Q12 - Deployment + ClusterIP Service + NetworkPolicy](#q12---deployment--clusterip-service--networkpolicy)
 - [Q13 - 修改既有 Pod 的 SecurityContext（runAsUser + capabilities）](#q13---修改既有-pod-的-securitycontextrunasuser--capabilities)
 - [Q16 - Pod 的 memory requests/limits 設定](#q16---pod-的-memory-requestslimits-設定)
@@ -339,7 +339,32 @@ spec:
 eof
 ```
 
+
 > 待補：`ckad-allow` 這個 NetworkPolicy 當時沒有留下解法紀錄，之後補測驗時可以再補上（依 `criteria: allow` 的 `podSelector` 限制 `Ingress` 存取）。
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ckad-allow
+  namespace: nginx-deployment
+spec:
+  podSelector:
+    matchLabels:
+      app: nginx-ckad
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              criteria: allow
+      ports:
+        - protocol: TCP
+          port: 80
+```
+
+
 
 ## Q13 - 修改既有 Pod 的 SecurityContext（runAsUser + capabilities）
 
