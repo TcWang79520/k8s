@@ -197,6 +197,61 @@ html[data-theme="dark"] .nv.on .n{color:#15201e}
 }
 .stat b{font-size:.95rem; color:var(--text); font-weight:650; font-variant-numeric:tabular-nums}
 
+/* ---------------- 考綱分類總覽 ---------------- */
+.ovw{margin:0 0 8px; scroll-margin-top:66px}
+.ovw-h{
+  display:flex; align-items:center; gap:10px; margin:0 0 8px;
+  font-size:.76rem; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--text-3); font-weight:650;
+}
+.ovw-h::after{content:""; flex:1; height:1px; background:var(--border)}
+.ovw-lede{margin:0 0 16px; color:var(--text-2); font-size:.89rem; max-width:68ch}
+.dom{
+  margin:0 0 10px; padding:16px 18px 15px; scroll-margin-top:66px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-l);
+  box-shadow:var(--shadow-1);
+}
+.dom-h{display:flex; align-items:center; gap:13px}
+.dom-w{
+  flex:none; width:52px; height:44px; border-radius:var(--r-m);
+  display:flex; align-items:baseline; justify-content:center; gap:1px;
+  background:var(--accent-soft); color:var(--accent-ink);
+}
+.dom-w b{font-size:1.12rem; font-weight:700; font-variant-numeric:tabular-nums; line-height:1}
+.dom-w i{font-style:normal; font-size:.7rem; font-weight:650}
+.dom-name{flex:1; min-width:0; display:flex; flex-direction:column}
+.dom-zh{font-size:1.02rem; font-weight:680; color:var(--text); line-height:1.4}
+.dom-en{font-size:.735rem; color:var(--text-3); line-height:1.45; letter-spacing:.01em}
+.dom-n{
+  flex:none; font-size:.75rem; color:var(--text-3); font-variant-numeric:tabular-nums;
+  background:var(--surface-2); border:1px solid var(--border);
+  border-radius:99px; padding:2px 10px;
+}
+.dom-desc{margin:9px 0 11px; font-size:.825rem; color:var(--text-2); line-height:1.7}
+.qrefs{display:flex; flex-wrap:wrap; gap:6px}
+.qref{
+  display:inline-flex; align-items:center; gap:7px; max-width:100%;
+  padding:5px 10px 5px 6px; border-radius:99px; text-decoration:none;
+  background:var(--surface-3); border:1px solid var(--border);
+  color:var(--text-2); font-size:.815rem; line-height:1.5;
+  transition:border-color var(--fast) var(--ease), color var(--fast) var(--ease),
+             background var(--fast) var(--ease);
+}
+.qref:hover{border-color:var(--accent); color:var(--text); background:var(--surface)}
+.qref-n{
+  flex:none; min-width:20px; height:20px; padding:0 5px; border-radius:99px;
+  display:grid; place-items:center; font-size:.71rem; font-weight:700;
+  font-variant-numeric:tabular-nums;
+  background:var(--surface-2); color:var(--text-3); border:1px solid var(--border);
+}
+.qref:hover .qref-n{background:var(--accent); color:#fff; border-color:transparent}
+html[data-theme="dark"] .qref:hover .qref-n{color:#15201e}
+.qref-t{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:46ch}
+.qref-s{
+  flex:none; font-size:.68rem; color:var(--text-3); letter-spacing:.03em;
+  padding-left:7px; border-left:1px solid var(--border-2);
+}
+
 /* ---------------- group header (one per source document) ---------------- */
 .grp{
   margin:46px 0 20px; padding:20px 24px 22px; scroll-margin-top:66px;
@@ -467,6 +522,9 @@ pre code{background:none; border:0; padding:0; font-size:1em; color:var(--text);
   <nav class="nav" id="nav" aria-label="題目導覽">
     <p class="nav-h">目錄</p>
     <div class="nav-grp">
+<a class="nv nv2 nv-ovw" href="#overview" data-t="考綱 分類 總覽 domain"><span class="n n-k">◎</span><span class="tx">考綱分類總覽</span></a>
+</div>
+<div class="nav-grp">
 <a class="nav-g" href="#grp-main"><span class="nav-g-t">考古題 20 題</span><span class="nav-g-n">20</span></a>
 <a class="nv nv2" href="#commonknowledge" data-t="commonknowledge  考古題 20 題"><span class="n n-k">K</span><span class="tx">CommonKnowledge</span></a>
 <a class="nv nv3" href="#修改既有物件優先用匯出--編輯--apply少用-kubectl-edit" data-t="修改既有物件：優先用「匯出 → 編輯 → apply」，少用 kubectl edit  考古題 20 題"><span class="tx">修改既有物件：優先用「匯出 → 編輯 → apply」，少用 kubectl edit</span></a>
@@ -552,6 +610,94 @@ pre code{background:none; border:0; padding:0; font-size:1em; color:var(--text);
         <span class="stat"><b>5</b> 份來源筆記</span>
       </div>
     </header>
+
+    <nav class="ovw" id="overview" aria-label="考綱分類總覽">
+<p class="ovw-h">依 CKAD 考綱分類</p>
+<p class="ovw-lede">同一類的題目散在考古題與各份模擬測驗裡，這裡依官方五大 Domain 收攏成一份索引，想補哪一塊就從這裡進去。</p>
+<section class="dom" id="dom-d1">
+<div class="dom-h">
+<span class="dom-w"><b>20</b><i>%</i></span>
+<span class="dom-name"><span class="dom-zh">應用設計與建置</span><span class="dom-en">Application Design and Build</span></span>
+<span class="dom-n">12 題</span>
+</div>
+<p class="dom-desc">容器映像檔、選對 workload 資源（Job/CronJob/Deployment）、多容器 Pod 設計模式、Volume</p>
+<div class="qrefs">
+<a class="qref" href="#題目1---cronjob-手動觸發-job" title="考古題 1 - CronJob 手動觸發 Job"><span class="qref-n">1</span><span class="qref-t">CronJob 手動觸發 Job</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目2---cronjob-建立不需手動觸發" title="考古題 2 - CronJob 建立（不需手動觸發）"><span class="qref-n">2</span><span class="qref-t">CronJob 建立（不需手動觸發）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目3---用-dockerfile-建置並匯出-oci-格式-image" title="考古題 3 - 用 Dockerfile 建置並匯出 OCI 格式 image"><span class="qref-n">3</span><span class="qref-t">用 Dockerfile 建置並匯出 OCI 格式 image</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目9---建立-deployment-並指定環境變數" title="考古題 9 - 建立 Deployment 並指定環境變數"><span class="qref-n">9</span><span class="qref-t">建立 Deployment 並指定環境變數</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#e2-q1---建立多容器-pod共享-emptydir-volume" title="Exam 2 1 - 建立多容器 Pod（共享 emptyDir volume）"><span class="qref-n">1</span><span class="qref-t">建立多容器 Pod（共享 emptyDir volume）</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e2-q2---建立多容器-pod環境變數印訊息" title="Exam 2 2 - 建立多容器 Pod（環境變數、印訊息）"><span class="qref-n">2</span><span class="qref-t">建立多容器 Pod（環境變數、印訊息）</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e2-q3---建立-jobalpine-執行-top" title="Exam 2 3 - 建立 Job（alpine 執行 top）"><span class="qref-n">3</span><span class="qref-t">建立 Job（alpine 執行 top）</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e2-q4---建立-pod-並設定自訂-annotation" title="Exam 2 4 - 建立 Pod 並設定自訂 Annotation"><span class="qref-n">4</span><span class="qref-t">建立 Pod 並設定自訂 Annotation</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e4-q2---建立-hostpath-型別的-persistentvolume" title="Exam 4 2 - 建立 hostPath 型別的 PersistentVolume"><span class="qref-n">2</span><span class="qref-t">建立 hostPath 型別的 PersistentVolume</span><span class="qref-s">Exam 4</span></a>
+<a class="qref" href="#ea-q1---建立-job-templatecompletions--parallelism--pod-labels" title="Exam A 1 - 建立 Job template（completions / parallelism / Pod labels）"><span class="qref-n">1</span><span class="qref-t">建立 Job template（completions / parallelism / Pod labels）</span><span class="qref-s">Exam A</span></a>
+<a class="qref" href="#ea-q2---建立-cronjob每-30-分鐘列出容器內程序" title="Exam A 2 - 建立 CronJob（每 30 分鐘列出容器內程序）"><span class="qref-n">2</span><span class="qref-t">建立 CronJob（每 30 分鐘列出容器內程序）</span><span class="qref-s">Exam A</span></a>
+<a class="qref" href="#ea-q4---為-deployment-加上-initcontainer共用-emptydir-寫入-indexhtml" title="Exam A 4 - 為 Deployment 加上 InitContainer（共用 emptyDir 寫入 index.html）"><span class="qref-n">4</span><span class="qref-t">為 Deployment 加上 InitContainer（共用 emptyDir 寫入 index.html）</span><span class="qref-s">Exam A</span></a>
+</div></section>
+<section class="dom" id="dom-d2">
+<div class="dom-h">
+<span class="dom-w"><b>20</b><i>%</i></span>
+<span class="dom-name"><span class="dom-zh">應用部署</span><span class="dom-en">Application Deployment</span></span>
+<span class="dom-n">5 題</span>
+</div>
+<p class="dom-desc">Deployment 與 rolling update、回滾、blue/green 與 canary 等部署策略</p>
+<div class="qrefs">
+<a class="qref" href="#題目7---金絲雀部署canary-deployment" title="考古題 7 - 金絲雀部署（Canary Deployment）"><span class="qref-n">7</span><span class="qref-t">金絲雀部署（Canary Deployment）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目15---deployment-升級策略更新與回滾" title="考古題 15 - Deployment 升級策略、更新與回滾"><span class="qref-n">15</span><span class="qref-t">Deployment 升級策略、更新與回滾</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目17---更新-deployment-並暴露-service" title="考古題 17 - 更新 Deployment 並暴露 Service"><span class="qref-n">17</span><span class="qref-t">更新 Deployment 並暴露 Service</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#e2-q6---deployment-滾動更新策略與-rollout-undo" title="Exam 2 6 - Deployment 滾動更新策略與 rollout undo"><span class="qref-n">6</span><span class="qref-t">Deployment 滾動更新策略與 rollout undo</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#ea-q5---deployment-滾動更新策略rollout-history-與-rollback" title="Exam A 5 - Deployment 滾動更新策略、rollout history 與 rollback"><span class="qref-n">5</span><span class="qref-t">Deployment 滾動更新策略、rollout history 與 rollback</span><span class="qref-s">Exam A</span></a>
+</div></section>
+<section class="dom" id="dom-d3">
+<div class="dom-h">
+<span class="dom-w"><b>15</b><i>%</i></span>
+<span class="dom-name"><span class="dom-zh">可觀測性與維運</span><span class="dom-en">Application Observability and Maintenance</span></span>
+<span class="dom-n">2 題</span>
+</div>
+<p class="dom-desc">liveness/readiness/startup 探針、日誌與事件、實際除錯流程</p>
+<div class="qrefs">
+<a class="qref" href="#題目13---liveness-probe-除錯跨-namespace-找壞掉的-pod" title="考古題 13 - Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）"><span class="qref-n">13</span><span class="qref-t">Liveness Probe 除錯（跨 namespace 找壞掉的 Pod）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目14---幫既有-deployment-加上-readinessprobe" title="考古題 14 - 幫既有 Deployment 加上 ReadinessProbe"><span class="qref-n">14</span><span class="qref-t">幫既有 Deployment 加上 ReadinessProbe</span><span class="qref-s">考古題</span></a>
+</div></section>
+<section class="dom" id="dom-d4">
+<div class="dom-h">
+<span class="dom-w"><b>25</b><i>%</i></span>
+<span class="dom-name"><span class="dom-zh">環境、設定與安全</span><span class="dom-en">Application Environment, Configuration and Security</span></span>
+<span class="dom-n">10 題</span>
+</div>
+<p class="dom-desc">ConfigMap/Secret、requests/limits/quota、SecurityContext、ServiceAccount 與 RBAC</p>
+<div class="qrefs">
+<a class="qref" href="#題目4---建立指定-cpu記憶體-resource-requests-的-pod" title="考古題 4 - 建立指定 CPU/記憶體 resource requests 的 Pod"><span class="qref-n">4</span><span class="qref-t">建立指定 CPU/記憶體 resource requests 的 Pod</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目5---修正-deployment-的記憶體-requestslimits依-namespace-limitrange" title="考古題 5 - 修正 Deployment 的記憶體 requests/limits（依 namespace LimitRange）"><span class="qref-n">5</span><span class="qref-t">修正 Deployment 的記憶體 requests/limits（依 namespace LimitRange）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目8---修改-deployment-的-securitycontextrunasuser--allowprivilegeescalation" title="考古題 8 - 修改 Deployment 的 SecurityContext（runAsUser / allowPrivilegeEscalation）"><span class="qref-n">8</span><span class="qref-t">修改 Deployment 的 SecurityContext（runAsUser / allowPrivilegeEscalation）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目10---rbac-授權除錯serviceaccount-權限不足" title="考古題 10 - RBAC 授權除錯（ServiceAccount 權限不足）"><span class="qref-n">10</span><span class="qref-t">RBAC 授權除錯（ServiceAccount 權限不足）</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目11---建立-configmap-並掛載成-volume" title="考古題 11 - 建立 ConfigMap 並掛載成 Volume"><span class="qref-n">11</span><span class="qref-t">建立 ConfigMap 並掛載成 Volume</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目12---建立-secret-並以環境變數使用" title="考古題 12 - 建立 Secret 並以環境變數使用"><span class="qref-n">12</span><span class="qref-t">建立 Secret 並以環境變數使用</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目16---serviceaccount-命名規則禁止自動掛載-token清理未使用的-sa" title="考古題 16 - ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA"><span class="qref-n">16</span><span class="qref-t">ServiceAccount 命名規則、禁止自動掛載 Token、清理未使用的 SA</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#e2-q13---修改既有-pod-的-securitycontextrunasuser--capabilities" title="Exam 2 13 - 修改既有 Pod 的 SecurityContext（runAsUser + capabilities）"><span class="qref-n">13</span><span class="qref-t">修改既有 Pod 的 SecurityContext（runAsUser + capabilities）</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e2-q16---pod-的-memory-requestslimits-設定" title="Exam 2 16 - Pod 的 memory requests/limits 設定"><span class="qref-n">16</span><span class="qref-t">Pod 的 memory requests/limits 設定</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e4-q1---建立-privileged-模式的-pod" title="Exam 4 1 - 建立 privileged 模式的 Pod"><span class="qref-n">1</span><span class="qref-t">建立 privileged 模式的 Pod</span><span class="qref-s">Exam 4</span></a>
+</div></section>
+<section class="dom" id="dom-d5">
+<div class="dom-h">
+<span class="dom-w"><b>20</b><i>%</i></span>
+<span class="dom-name"><span class="dom-zh">服務與網路</span><span class="dom-en">Services and Networking</span></span>
+<span class="dom-n">9 題</span>
+</div>
+<p class="dom-desc">Service 各種類型與連線偵錯、Ingress、NetworkPolicy</p>
+<div class="qrefs">
+<a class="qref" href="#題目18---用既有-networkpolicy-限制-pod-只能跟指定對象通訊" title="考古題 18 - 用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊"><span class="qref-n">18</span><span class="qref-t">用既有 NetworkPolicy 限制 Pod 只能跟指定對象通訊</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目19---ingress-排錯-1" title="考古題 19 - Ingress 排錯-1"><span class="qref-n">19</span><span class="qref-t">Ingress 排錯-1</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#題目20---ingress-排錯-2" title="考古題 20 - Ingress 排錯-2"><span class="qref-n">20</span><span class="qref-t">Ingress 排錯-2</span><span class="qref-s">考古題</span></a>
+<a class="qref" href="#e1-q9---建立-deny-all-的-networkpolicy拒絕所有進出流量" title="Exam 1 9 - 建立 deny-all 的 NetworkPolicy（拒絕所有進出流量）"><span class="qref-n">9</span><span class="qref-t">建立 deny-all 的 NetworkPolicy（拒絕所有進出流量）</span><span class="qref-s">Exam 1</span></a>
+<a class="qref" href="#e1-q10---讓叢集內-pod-連到叢集外的服務手動建立-endpointslice" title="Exam 1 10 - 讓叢集內 Pod 連到叢集外的服務（手動建立 EndpointSlice）"><span class="qref-n">10</span><span class="qref-t">讓叢集內 Pod 連到叢集外的服務（手動建立 EndpointSlice）</span><span class="qref-s">Exam 1</span></a>
+<a class="qref" href="#e1-q12---建立-externalname-service" title="Exam 1 12 - 建立 ExternalName Service"><span class="qref-n">12</span><span class="qref-t">建立 ExternalName Service</span><span class="qref-s">Exam 1</span></a>
+<a class="qref" href="#e2-q10---servicenodeportclusterip與-networkpolicy" title="Exam 2 10 - Service（NodePort/ClusterIP）與 NetworkPolicy"><span class="qref-n">10</span><span class="qref-t">Service（NodePort/ClusterIP）與 NetworkPolicy</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#e2-q12---deployment--clusterip-service--networkpolicy" title="Exam 2 12 - Deployment + ClusterIP Service + NetworkPolicy"><span class="qref-n">12</span><span class="qref-t">Deployment + ClusterIP Service + NetworkPolicy</span><span class="qref-s">Exam 2</span></a>
+<a class="qref" href="#ea-q3---nodeport--clusterip-service-與-networkpolicy三層式應用" title="Exam A 3 - NodePort / ClusterIP Service 與 NetworkPolicy（三層式應用）"><span class="qref-n">3</span><span class="qref-t">NodePort / ClusterIP Service 與 NetworkPolicy（三層式應用）</span><span class="qref-s">Exam A</span></a>
+</div></section>
+</nav>
 
     <section class="grp" id="grp-main">
 <p class="grp-kicker">CKAD 考古題</p>

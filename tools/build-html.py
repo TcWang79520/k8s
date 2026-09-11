@@ -30,6 +30,53 @@ DOCS = [
 # markdown filename (as written in links) -> anchor prefix, for cross-doc links
 DOC_BY_NAME = {}
 
+# ---------------------------------------------------------------- CKAD 考綱分類
+# 官方五大 Domain 與權重。考古題的歸類直接讀 md 裡既有的「對應考綱 Domain」，
+# 模擬測驗沒有這個欄位，改用下面的 MOCK_DOMAIN 對照表。
+DOMAINS = [
+    ('d1', 'Application Design and Build', '應用設計與建置', 20,
+     '容器映像檔、選對 workload 資源（Job/CronJob/Deployment）、多容器 Pod 設計模式、Volume'),
+    ('d2', 'Application Deployment', '應用部署', 20,
+     'Deployment 與 rolling update、回滾、blue/green 與 canary 等部署策略'),
+    ('d3', 'Application Observability and Maintenance', '可觀測性與維運', 15,
+     'liveness/readiness/startup 探針、日誌與事件、實際除錯流程'),
+    ('d4', 'Application Environment, Configuration and Security', '環境、設定與安全', 25,
+     'ConfigMap/Secret、requests/limits/quota、SecurityContext、ServiceAccount 與 RBAC'),
+    ('d5', 'Services and Networking', '服務與網路', 20,
+     'Service 各種類型與連線偵錯、Ingress、NetworkPolicy'),
+]
+DOMAIN_BY_EN = {
+    'Application Design and Build': 'd1',
+    'Application Deployment': 'd2',
+    'Application Observability and Maintenance': 'd3',
+    'Application Environment, Configuration and Security': 'd4',
+    'Services and Networking': 'd5',
+}
+# 模擬測驗題目的考綱歸類：(文件前綴, 題號) -> domain key
+MOCK_DOMAIN = {
+    ('e1', '9'): 'd5',    # deny-all NetworkPolicy
+    ('e1', '10'): 'd5',   # EndpointSlice 接叢集外服務
+    ('e1', '12'): 'd5',   # ExternalName Service
+    ('e2', '1'): 'd1',    # 多容器 Pod + emptyDir
+    ('e2', '2'): 'd1',    # 多容器 Pod + env
+    ('e2', '3'): 'd1',    # Job
+    ('e2', '4'): 'd1',    # Pod annotation
+    ('e2', '6'): 'd2',    # rollout undo
+    ('e2', '10'): 'd5',   # Service + NetworkPolicy
+    ('e2', '12'): 'd5',   # Service + NetworkPolicy
+    ('e2', '13'): 'd4',   # SecurityContext / capabilities
+    ('e2', '16'): 'd4',   # memory requests/limits
+    ('e4', '1'): 'd4',    # privileged 模式
+    ('e4', '2'): 'd1',    # hostPath PersistentVolume
+    ('ea', '1'): 'd1',    # Job template
+    ('ea', '2'): 'd1',    # CronJob
+    ('ea', '3'): 'd5',    # Service + NetworkPolicy
+    ('ea', '4'): 'd1',    # InitContainer + emptyDir
+    ('ea', '5'): 'd2',    # rolling update / rollback
+}
+# 總覽卡片上的來源標籤
+SRC_TAG = {'': '考古題', 'e1': 'Exam 1', 'e2': 'Exam 2', 'e4': 'Exam 4', 'ea': 'Exam A'}
+
 # the document currently being rendered
 CUR = {'prefix': '', 'dir': ''}
 
@@ -563,8 +610,8 @@ def render_doc(path, prefix, out, toc):
         if idx_items:
             start += 1
 
-    # per-section CKAD/ file references, keyed by the section's plain title
-    section_files = {}
+    # per-section CKAD/ file references + 考綱 domain, keyed by the section's plain title
+    section_files, section_domain = {}, {}
     for chunk in re.split(r'\n(?=## )', raw):
         if not chunk.startswith('## '):
             continue
@@ -573,6 +620,9 @@ def render_doc(path, prefix, out, toc):
         # the numeric-prefix rule (04-… == 題目4) only applies to the 考古題 doc
         num = m.group(1) if (m and prefix == '') else ''
         section_files[sec_title] = files_for_section(num, chunk)
+        dm = re.search(r'\*\*對應考綱 Domain\*\*[^\n]*\n+\s*`([^`]+)`', chunk)
+        if dm:
+            section_domain[sec_title] = DOMAIN_BY_EN.get(dm.group(1).strip(), '')
 
     state = {'sec': False, 'blk': None, 'files': []}
     nsec = 0
@@ -606,7 +656,17 @@ def render_doc(path, prefix, out, toc):
                 num, name, kind = ('', plain(text), 'k')
                 if m:
                     num, name, kind = m.group(1), m.group(2), 'q'
-                toc.append({'id': sid, 'lvl': 2, 'num': num, 'name': name, 'grp': prefix})
+                dom = ''
+                if num:
+                    dom = (section_domain.get(plain(text), '') if prefix == ''
+                           else MOCK_DOMAIN.get((prefix, num), ''))
+                    if not dom:
+                        raise SystemExit(
+                            '缺少考綱歸類：%s 的「%s」。考古題請在 md 補上「對應考綱 Domain」，'
+                            '模擬測驗請在 build-html.py 的 MOCK_DOMAIN 加一筆 (%r, %r)。'
+                            % (path, plain(text), prefix, num))
+                toc.append({'id': sid, 'lvl': 2, 'num': num, 'name': name,
+                            'grp': prefix, 'dom': dom})
                 nsec += 1
                 out.append('<section class="sec sec-%s" id="%s">' % (kind, sid))
                 badge = ('<span class="qnum">%s</span>' % esc(num)) if num \
@@ -620,7 +680,8 @@ def render_doc(path, prefix, out, toc):
             else:
                 close_blk()
                 sid = slug(text)
-                toc.append({'id': sid, 'lvl': 3, 'num': '', 'name': plain(text), 'grp': prefix})
+                toc.append({'id': sid, 'lvl': 3, 'num': '', 'name': plain(text),
+                            'grp': prefix, 'dom': ''})
                 out.append('<h3 id="%s">%s<a class="anchor" href="#%s" '
                            'aria-label="複製此段落連結">#</a></h3>' % (sid, inline(text), sid))
             continue
@@ -671,6 +732,38 @@ def cards_html(idx_items):
     return '\n'.join(cards)
 
 
+def overview_html(toc):
+    """開頭的考綱分類總覽：五大類，每類列出跨全部來源的題目連結。"""
+    order = {prefix: i for i, (_p, prefix, _n, _k) in enumerate(DOCS)}
+    out = ['<nav class="ovw" id="overview" aria-label="考綱分類總覽">']
+    out.append('<p class="ovw-h">依 CKAD 考綱分類</p>')
+    out.append('<p class="ovw-lede">同一類的題目散在考古題與各份模擬測驗裡，'
+               '這裡依官方五大 Domain 收攏成一份索引，想補哪一塊就從這裡進去。</p>')
+    for key, en, zh, weight, desc in DOMAINS:
+        items = [e for e in toc if e.get('dom') == key]
+        items.sort(key=lambda e: (order.get(e['grp'], 99), int(e['num'])))
+        out.append('<section class="dom" id="dom-%s">' % key)
+        out.append('<div class="dom-h">')
+        out.append('<span class="dom-w"><b>%d</b><i>%%</i></span>' % weight)
+        out.append('<span class="dom-name"><span class="dom-zh">%s</span>'
+                   '<span class="dom-en">%s</span></span>' % (esc(zh), esc(en)))
+        out.append('<span class="dom-n">%d 題</span>' % len(items))
+        out.append('</div>')
+        out.append('<p class="dom-desc">%s</p>' % esc(desc))
+        out.append('<div class="qrefs">')
+        for e in items:
+            tag = SRC_TAG.get(e['grp'], e['grp'])
+            out.append('<a class="qref" href="#%s" title="%s %s - %s">'
+                       '<span class="qref-n">%s</span>'
+                       '<span class="qref-t">%s</span>'
+                       '<span class="qref-s">%s</span></a>'
+                       % (e['id'], esc(tag), esc(e['num']), html.escape(e['name'], quote=True),
+                          esc(e['num']), esc(e['name']), esc(tag)))
+        out.append('</div></section>')
+    out.append('</nav>')
+    return '\n'.join(out)
+
+
 def main():
     for path, prefix, _name, _kicker in DOCS:
         DOC_BY_NAME[path.split('/')[-1]] = prefix
@@ -697,8 +790,11 @@ def main():
         groups.append({'id': gid, 'name': name, 'kicker': kicker,
                        'prefix': prefix, 'n': nsec, 'title': doc_title})
 
-    # ---- sidebar: one collapsible-free group per source document
-    nav = []
+    # ---- sidebar: 總覽捷徑，接著每份來源一組
+    nav = ['<div class="nav-grp">',
+           '<a class="nv nv2 nv-ovw" href="#overview" data-t="考綱 分類 總覽 domain">'
+           '<span class="n n-k">◎</span><span class="tx">考綱分類總覽</span></a>',
+           '</div>']
     for g in groups:
         nav.append('<div class="nav-grp">')
         nav.append('<a class="nav-g" href="#%s"><span class="nav-g-t">%s</span>'
@@ -733,6 +829,7 @@ def main():
               .replace('{{INTRO}}', esc(DOC_LEDE))
               .replace('{{NAV}}', '\n'.join(nav))
               .replace('{{STATS}}', '\n        '.join(stats))
+              .replace('{{OVERVIEW}}', overview_html(toc))
               .replace('{{CONTENT}}', '\n'.join(out)))
     open(DST, 'w', encoding='utf-8').write(doc)
     print('OK docs=%d sections=%d (考古題 %d / 模擬 %d) bytes=%d'
